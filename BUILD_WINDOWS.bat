@@ -39,7 +39,7 @@ echo [1/4] Python: %PY%
 rem ---- 2) Paketler
 echo [2/4] Gerekli paketler yukleniyor (ilk seferde birkac dakika surebilir)...
 %PY% -m pip install --upgrade pip >> "%LOG%" 2>&1
-%PY% -m pip install PySide6 openpyxl Pillow reportlab qrcode pypdf pillow-heif pyinstaller >> "%LOG%" 2>&1
+%PY% -m pip install PySide6 openpyxl Pillow reportlab qrcode pypdf pillow-heif pyinstaller opencv-python-headless rapidocr_onnxruntime >> "%LOG%" 2>&1
 if errorlevel 1 (
   echo HATA: Paketler yuklenemedi. Ayrintilar build_log.txt dosyasinda.
   pause
@@ -52,6 +52,7 @@ echo [3/4] EXE derleniyor...
 set "EXTRA="
 %PY% -c "import winocr" >nul 2>&1 && set "EXTRA=--collect-all winocr --collect-all winrt"
 %PY% -c "import pillow_heif" >nul 2>&1 && set "EXTRA=%EXTRA% --collect-all pillow_heif"
+set "EXTRA=%EXTRA% --collect-all rapidocr_onnxruntime --collect-all onnxruntime --collect-submodules cv2"
 %PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name "SINETECHNIC_GIDER" --icon "assets\icon.ico" --add-data "assets;assets" %EXTRA% gider.py >> "%LOG%" 2>&1
 if not exist "dist\SINETECHNIC_GIDER.exe" (
   echo HATA: EXE olusmadi. Ayrintilar build_log.txt dosyasinda.

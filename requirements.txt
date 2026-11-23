@@ -6,3 +6,5 @@ qrcode>=7.4
 pypdf>=4
 pillow-heif>=0.16
 winocr>=0.0.13; sys_platform == "win32"
+opencv-python-headless>=4.9
+rapidocr_onnxruntime>=1.2

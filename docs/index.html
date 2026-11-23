@@ -59,7 +59,7 @@ a{color:#ffb27a}
 <label>Tutar (boş bırakırsan program fişten okumaya çalışır)</label><input id="tutar" inputmode="decimal" placeholder="örn. 2500,00">
 <div class="row">
   <div><label>Kategori</label><select id="kategori">
-    <option>Akaryakıt</option><option>Yedek Parça / Malzeme</option><option>Yemek</option><option>Konaklama</option>
+    <option value="">Otomatik (fişten)</option><option>Akaryakıt</option><option>Yedek Parça / Malzeme</option><option>Yemek</option><option>Konaklama</option>
     <option>Ulaşım / Otoyol / Otopark</option><option>Telefon / İnternet</option><option>Kırtasiye</option>
     <option>Kargo</option><option>Araç Bakım</option><option>Diğer</option></select></div>
   <div><label>Ödeme</label><select id="odeme"><option>Kredi Kartı</option><option>Banka Kartı</option><option>Nakit</option><option>Havale / EFT</option></select></div>
@@ -138,10 +138,10 @@ function shrink(file) {
     if (file.type.indexOf('image/') !== 0) { ok(file); return; }
     var img = new Image();
     img.onload = function () {
-      var M = 1600, w = img.naturalWidth, h = img.naturalHeight, s = Math.min(1, M / Math.max(w, h));
+      var M = 2600, w = img.naturalWidth, h = img.naturalHeight, s = Math.min(1, M / Math.max(w, h));
       var c = document.createElement('canvas'); c.width = Math.round(w * s); c.height = Math.round(h * s);
       var g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
-      c.toBlob(function (b) { ok(b || file); }, 'image/jpeg', 0.75);
+      c.toBlob(function (b) { ok(b || file); }, 'image/jpeg', 0.82);
     };
     img.onerror = function () { ok(file); };
     img.src = URL.createObjectURL(file);

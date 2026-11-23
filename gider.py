@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
                                QWidget)
 
 APP_NAME = "SİNETECHNİC GİDER"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 OWNER = "Volkan Sezer"
 WEBSITE = "https://www.sinetechnic.com"
 EMAIL = "volkan.sezer@sinetechnic.com"
@@ -296,42 +296,178 @@ def yerel_ip():
         return "127.0.0.1"
 
 
-def gorsel_hazirla(src_bytes, tarama=True):
-    """Fotoğrafı düzeltir, küçültür ve JPEG baytları döndürür."""
+def _heif():
     try:
         from pillow_heif import register_heif_opener  # type: ignore
         register_heif_opener()
     except Exception:
         pass
-    im = Image.open(BytesIO(src_bytes))
-    im = ImageOps.exif_transpose(im).convert("RGB")
-    im.thumbnail((2200, 2200))
-    if tarama:
-        g = ImageOps.grayscale(im)
-        g = ImageOps.autocontrast(g, cutoff=1)
-        g = ImageEnhance.Sharpness(g).enhance(1.6)
-        im = g.convert("RGB")
+
+
+def log_yaz(dosya, mesaj):
+    try:
+        with open(os.path.join(ROOT, dosya), "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {mesaj}\n")
+    except Exception:
+        pass
+
+
+# ---------------- belge tarama (fişi fotoğraftan bul, düzleştir, taranmış görünüm ver)
+def _sirala(pts):
+    import numpy as np
+    pts = pts.reshape(4, 2).astype("float32")
+    s = pts.sum(1)
+    d = np.diff(pts, axis=1).ravel()
+    return np.array([pts[s.argmin()], pts[d.argmin()], pts[s.argmax()], pts[d.argmax()]], dtype="float32")
+
+
+def belge_bul(img):
+    """Fotoğraftaki en büyük açık renkli belgeyi (fişi) bulur. (köşeler, kesin_mi) veya None."""
+    import cv2
+    import numpy as np
+    h, w = img.shape[:2]
+    sc = 1000.0 / max(h, w)
+    small = cv2.resize(img, (max(1, int(w * sc)), max(1, int(h * sc))), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    t1, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    ust = blur[blur > t1]
+    t2 = cv2.threshold(ust.reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0] if ust.size > 100 else t1
+    beyaz = cv2.inRange(hsv, (0, 0, 0), (180, 70, 255))
+    adaylar = [cv2.bitwise_and(cv2.threshold(blur, t1, 255, cv2.THRESH_BINARY)[1], beyaz)]
+    for t in (t2, max(t1, t2 - 15)):
+        m = cv2.bitwise_and(cv2.threshold(blur, t, 255, cv2.THRESH_BINARY)[1], beyaz)
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25)))
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21)))
+        adaylar.append(m)
+    edges = cv2.dilate(cv2.Canny(blur, 50, 150), cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), iterations=2)
+    adaylar.append(edges)
+    alan_top = small.shape[0] * small.shape[1]
+    en_iyi = None
+    for m in adaylar:
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in sorted(cnts, key=cv2.contourArea, reverse=True)[:5]:
+            a = cv2.contourArea(c)
+            if a < 0.05 * alan_top:
+                break
+            if a > 0.97 * alan_top:
+                continue
+            ap = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True)
+            dort = len(ap) == 4 and cv2.isContourConvex(ap)
+            q = ap if dort else cv2.boxPoints(cv2.minAreaRect(c)).astype("int32")
+            mm = np.zeros(gray.shape, np.uint8)
+            cv2.drawContours(mm, [q.reshape(-1, 1, 2)], -1, 255, -1)
+            parlak = cv2.mean(gray, mask=mm)[0]
+            dolu = min(1.0, a / (cv2.contourArea(q.reshape(-1, 1, 2).astype("float32")) or 1))
+            skor = a * (parlak / 255.0) ** 4 * dolu ** 2 * (1.2 if dort else 1.0)
+            if en_iyi is None or skor > en_iyi[0]:
+                en_iyi = (skor, q, dort)
+    if en_iyi is None:
+        return None
+    return _sirala(en_iyi[1].astype("float32") / sc), en_iyi[2]
+
+
+def _duzlestir(img, q):
+    import cv2
+    import numpy as np
+    tl, tr, br, bl = q
+    W = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+    H = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+    if W < 50 or H < 50:
+        return img
+    M = cv2.getPerspectiveTransform(q, np.array([[0, 0], [W - 1, 0], [W - 1, H - 1], [0, H - 1]], dtype="float32"))
+    return cv2.warpPerspective(img, M, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+
+def _tarama_gorunumu(img):
+    import cv2
+    import numpy as np
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    k = max(15, (min(gray.shape) // 20) | 1)
+    bg = cv2.medianBlur(cv2.dilate(gray, np.ones((7, 7), np.uint8)), k)
+    norm = cv2.divide(gray, bg, scale=255)
+    norm = cv2.normalize(norm, None, 0, 255, cv2.NORM_MINMAX)
+    lut = np.array([255 * (i / 255.0) ** 2.2 for i in range(256)], np.uint8)
+    norm = cv2.normalize(cv2.LUT(norm, lut), None, 0, 255, cv2.NORM_MINMAX)
+    blur = cv2.GaussianBlur(norm, (0, 0), 1.0)
+    return cv2.addWeighted(norm, 1.5, blur, -0.5, 0)
+
+
+def belge_tara(pil_img):
+    """PIL görüntüsünden taranmış belge (PIL, gri) üretir. (görüntü, fiş_bulundu_mu)"""
+    import cv2
+    import numpy as np
+    img = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+    bulundu = False
+    try:
+        r = belge_bul(img)
+        if r:
+            q, kesin = r
+            img = _duzlestir(img, q)
+            bulundu = True
+            if not kesin:
+                r2 = belge_bul(img)
+                if r2:
+                    a2 = cv2.contourArea(r2[0].reshape(-1, 1, 2))
+                    if 0.45 < a2 / float(img.shape[0] * img.shape[1]) < 0.95:
+                        img = _duzlestir(img, r2[0])
+    except Exception as e:
+        log_yaz("tarama_log.txt", f"belge bulunamadı: {e!r}")
+    h, w = img.shape[:2]
+    if w < 1200:
+        f = 1200.0 / w
+        img = cv2.resize(img, (int(w * f), int(h * f)), interpolation=cv2.INTER_CUBIC)
+    if h > 4000 or w > 2400:
+        f = min(4000.0 / h, 2400.0 / w)
+        img = cv2.resize(img, (int(w * f), int(h * f)), interpolation=cv2.INTER_AREA)
+    return Image.fromarray(_tarama_gorunumu(img)), bulundu
+
+
+def gorsel_hazirla(src_bytes, tarama=True):
+    """(kaydedilecek JPEG, orijinal JPEG) döndürür. Tarama açıksa fiş bulunup düzleştirilir."""
+    _heif()
+    im = ImageOps.exif_transpose(Image.open(BytesIO(src_bytes))).convert("RGB")
+    im.thumbnail((3000, 3000))
+    orj = BytesIO()
+    im.save(orj, "JPEG", quality=85, optimize=True)
+    if not tarama:
+        return orj.getvalue(), orj.getvalue()
+    try:
+        sc, _ = belge_tara(im)
+    except Exception as e:
+        log_yaz("tarama_log.txt", f"tarama hatası: {e!r}")
+        sc = ImageEnhance.Sharpness(ImageOps.autocontrast(ImageOps.grayscale(im), cutoff=1)).enhance(1.6)
     out = BytesIO()
-    im.save(out, "JPEG", quality=85, optimize=True)
-    return out.getvalue()
+    sc.convert("L").save(out, "JPEG", quality=88, optimize=True)
+    return out.getvalue(), orj.getvalue()
+
+
+def orj_yolu(rel):
+    p = abs_path(rel)
+    return os.path.join(os.path.dirname(p), "orj", os.path.basename(p))
 
 
 def dosya_kaydet(data: bytes, ext: str, tarih: str, tarama=True):
-    """Belgeyi fisler/YYYY-MM klasörüne kaydeder, ROOT'a göreli yolu döndürür."""
-    ym = tarih[:7]
-    folder = os.path.join(ROOT, "fisler", ym)
+    """Belgeyi fisler/YYYY-MM klasörüne kaydeder (orijinali fisler/YYYY-MM/orj altında), ROOT'a göreli yolu döndürür."""
+    folder = os.path.join(ROOT, "fisler", tarih[:7])
     os.makedirs(folder, exist_ok=True)
     ext = ext.lower()
+    orj = None
     if ext in IMG_EXT:
         try:
-            data = gorsel_hazirla(data, tarama)
+            data, orj = gorsel_hazirla(data, tarama)
             ext = ".jpg"
-        except Exception:
-            pass
+        except Exception as e:
+            log_yaz("tarama_log.txt", f"görsel hazırlanamadı: {e!r}")
     name = datetime.now().strftime("%Y%m%d_%H%M%S_") + secrets.token_hex(3) + ext
     path = os.path.join(folder, name)
     with open(path, "wb") as f:
         f.write(data)
+    if orj:
+        os.makedirs(os.path.join(folder, "orj"), exist_ok=True)
+        with open(os.path.join(folder, "orj", name), "wb") as f:
+            f.write(orj)
     return os.path.relpath(path, ROOT)
 
 
@@ -339,29 +475,78 @@ def abs_path(rel):
     return os.path.join(ROOT, rel) if rel else ""
 
 
-# ----------------------------------------------------------------- OCR (Windows yerleşik OCR)
-def ocr_metin(path):
-    if not path or not path.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")):
+def dosya_tasi(rel, yeni_ym):
+    """Belgeyi (ve orijinalini) başka ay klasörüne taşır, yeni göreli yolu döndürür."""
+    src = abs_path(rel)
+    dd = os.path.join(ROOT, "fisler", yeni_ym)
+    os.makedirs(dd, exist_ok=True)
+    dst = os.path.join(dd, os.path.basename(src))
+    shutil.move(src, dst)
+    o = orj_yolu(rel)
+    if os.path.exists(o):
+        os.makedirs(os.path.join(dd, "orj"), exist_ok=True)
+        shutil.move(o, os.path.join(dd, "orj", os.path.basename(src)))
+    return os.path.relpath(dst, ROOT)
+
+
+# ---------------- OCR: gömülü RapidOCR (birincil) + Windows OCR (yedek)
+_ocr_motor = None
+_ocr_kilit = threading.Lock()
+
+
+def _rapid_ocr(img):
+    global _ocr_motor
+    from rapidocr_onnxruntime import RapidOCR  # type: ignore
+    import numpy as np
+    with _ocr_kilit:
+        if _ocr_motor is None:
+            _ocr_motor = RapidOCR()
+        res, _ = _ocr_motor(np.array(img.convert("RGB")))
+    if not res:
         return ""
-    try:
-        import asyncio
-        import winocr  # type: ignore
-    except Exception:
-        return ""
-    img = Image.open(path).convert("RGB")
+    kutular = []
+    for box, txt, conf in res:
+        ys = [p[1] for p in box]
+        xs = [p[0] for p in box]
+        kutular.append(((min(ys) + max(ys)) / 2, max(ys) - min(ys), min(xs), txt))
+    kutular.sort()
+    satirlar, cur = [], []
+    for k in kutular:
+        if cur and abs(k[0] - cur[-1][0]) > max(8, 0.55 * max(k[1], cur[-1][1])):
+            satirlar.append(cur)
+            cur = []
+        cur.append(k)
+    if cur:
+        satirlar.append(cur)
+    return "\n".join("  ".join(t[3] for t in sorted(s, key=lambda x: x[2])) for s in satirlar)
+
+
+def _win_ocr(img):
+    import asyncio
+    import winocr  # type: ignore
     for lang in ("tr", "tr-TR", "en-US", "en"):
         try:
             res = asyncio.run(winocr.recognize_pil(img, lang))
-            text = getattr(res, "text", None)
-            if text is None and isinstance(res, dict):
-                text = res.get("text")
+            lines = [getattr(ln, "text", "") for ln in (getattr(res, "lines", None) or [])]
+            text = "\n".join(lines) if lines else (getattr(res, "text", None) or "")
             if text:
-                lines = []
-                for ln in getattr(res, "lines", []) or []:
-                    lines.append(getattr(ln, "text", ""))
-                return "\n".join(lines) if lines else text
-        except Exception:
-            continue
+                return text
+        except Exception as e:
+            log_yaz("ocr_log.txt", f"winocr {lang}: {e!r}")
+    return ""
+
+
+def ocr_metin(path):
+    if not path or not path.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")):
+        return ""
+    img = Image.open(path).convert("RGB")
+    for ad, fn in (("rapidocr", _rapid_ocr), ("winocr", _win_ocr)):
+        try:
+            text = fn(img)
+            if text and len(text.strip()) > 10:
+                return text
+        except Exception as e:
+            log_yaz("ocr_log.txt", f"{ad} hatası: {e!r}")
     return ""
 
 
@@ -387,59 +572,80 @@ def sayi_oku(s):
         return None
 
 
+KATEGORI_KELIME = [
+    ("Akaryakıt", r"MOTORIN|BENZIN|\bLPG\b|AKARYAKIT|OPET|SHELL|PETROL|TOTAL|AYTEMIZ|\bBP\b|DIZEL|EURODIESEL|KURSUNSUZ|POMPA"),
+    ("Yemek", r"DONER|KEBAP|LOKANTA|RESTORAN|RESTAURANT|CAFE|KAFE|PIDE|BURGER|PIZZA|CORBA|AYRAN|SUAVYRAN|COLA|BAKLAVA|PASTANE|SIMIT|TOST|YEMEK|MENU"),
+    ("Ulaşım / Otoyol / Otopark", r"OTOPARK|OTOYOL|KOPRU|HGS|OGS|TAKSI|ISPARK"),
+    ("Konaklama", r"OTEL|HOTEL|PANSIYON|KONAKLAMA"),
+    ("Kargo", r"KARGO|YURTICI|ARAS|MNG|SURAT|PTT"),
+    ("Kırtasiye", r"KIRTASIYE|KAGIT|TONER|KARTUS"),
+    ("Telefon / İnternet", r"TURKCELL|VODAFONE|TURK TELEKOM|SUPERONLINE|INTERNET"),
+    ("Araç Bakım", r"LASTIK|OTO SERVIS|YAG DEGISIM|OTO YIKAMA|AKU"),
+    ("Yedek Parça / Malzeme", r"ELEKTRIK|HIRDAVAT|YAPI MARKET|KOCTAS|BAUHAUS|LAMBA|KABLO|ELEKTRONIK"),
+]
+
+
 def fis_ayristir(text):
     """OCR metninden alanları tahmin eder."""
     out = {}
     if not text:
         return out
-    up = text.upper().replace("İ", "I")
+    tr_map = str.maketrans("İIĞÜŞÖÇığüşöç", "IIGUSOCiguscc")
+    up = text.translate(tr_map).upper()
     lines = [l.strip() for l in up.splitlines() if l.strip()]
 
-    m = re.search(r"(\d{2})[./-](\d{2})[./-](\d{4})", up)
-    if m:
+    for m in re.finditer(r"\b(\d{1,2})\s?[./-]\s?(\d{1,2})\s?[./-]\s?(\d{4}|\d{2})\b", up):
         d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        y = y + 2000 if y < 100 else y
         try:
-            out["tarih"] = date(y, mo, d).isoformat()
+            dt = date(y, mo, d)
         except ValueError:
-            pass
+            continue
+        if date(2020, 1, 1) <= dt <= date.today():
+            out["tarih"] = dt.isoformat()
+            break
 
-    toplam = None
-    kdv = None
-    for ln in lines:
-        amounts = [_tutar(a) for a in TUTAR_RE.findall(ln)]
-        amounts = [a for a in amounts if a is not None]
+    toplam = kdv = None
+    for i, ln in enumerate(lines):
+        amounts = [a for a in (_tutar(x) for x in TUTAR_RE.findall(ln)) if a is not None]
+        if not amounts and i + 1 < len(lines) and re.search(r"TOP", ln):
+            amounts = [a for a in (_tutar(x) for x in TUTAR_RE.findall(lines[i + 1])) if a is not None]
         if not amounts:
             continue
-        if ("TOPKDV" in ln or "TOP KDV" in ln or "TOPLAM KDV" in ln) and kdv is None:
+        sade = ln.replace(" ", "")
+        if ("TOPKDV" in sade or "TOPLAMKDV" in sade) and kdv is None:
             kdv = amounts[-1]
-        elif "TOPLAM" in ln or re.search(r"\bTOP\b", ln) or "GENEL" in ln:
-            if "KDV" not in ln:
-                toplam = max(toplam or 0, amounts[-1])
+        elif ("TOPLAM" in sade or re.search(r"\bTOP\b", ln) or "GENELTOPLAM" in sade or "ODENECEK" in sade) and "KDV" not in sade:
+            toplam = max(toplam or 0, amounts[-1])
     if toplam is None:
-        alla = [_tutar(a) for a in TUTAR_RE.findall(up)]
-        alla = [a for a in alla if a]
+        alla = [a for a in (_tutar(x) for x in TUTAR_RE.findall(up)) if a]
         if alla:
             toplam = max(alla)
     if toplam:
         out["tutar"] = toplam
-    if kdv:
+    if kdv and toplam and kdv < toplam:
         out["kdv"] = kdv
+        oran = kdv / max(0.01, toplam - kdv) * 100
+        out["kdv_orani"] = min((1.0, 10.0, 20.0), key=lambda o: abs(o - oran))
 
-    m = re.search(r"F[I]S\s*NO\s*[:.]?\s*(\d+)", up)
+    m = re.search(r"F[I1]S\s*N[O0]\s*[:.]?\s*(\d+)", up)
     if m:
         out["belge_no"] = m.group(1)
-    m = re.search(r"(?:VKN|V\.?\s?NO|VERGI\s*NO|V\.?D\.?)[^\d]{0,25}(\d{10,11})", up)
+    m = re.search(r"(?:VKN|V\.?\s?NO|VERGI\s*NO|\bV\.?\s?D\.?\b|\bVD\b)[^\d]{0,25}(\d{10,11})", up)
     if m:
         out["vkn"] = m.group(1)
-    m = re.search(r"\b(\d{2}\s?[A-Z]{1,3}\s?\d{2,4})\b", up)
-    if m and "PLAKA" in up:
+    m = re.search(r"PLAKA[^A-Z0-9]{0,5}(\d{2}\s?[A-Z]{1,3}\s?\d{2,4})", up)
+    if m:
         out["plaka"] = m.group(1).replace(" ", "")
 
-    if re.search(r"MOTORIN|BENZIN|LPG|AKARYAKIT|OPET|SHELL|PETROL|TOTALENERGIES|AYTEMIZ|\bBP\b|DIZEL|EURODIESEL", up):
-        out["kategori"] = "Akaryakıt"
-        out["kdv_orani"] = 20.0
+    for kat, pat in KATEGORI_KELIME:
+        if re.search(pat, up):
+            out["kategori"] = kat
+            if kat == "Akaryakıt":
+                out.setdefault("kdv_orani", 20.0)
+            break
     for ln in lines[:6]:
-        if len(re.sub(r"[^A-Z]", "", ln)) >= 4 and not re.search(r"\d{2}[./-]\d{2}", ln):
+        if len(re.sub(r"[^A-Z]", "", ln)) >= 4 and not re.search(r"\d{1,2}[./-]\d{1,2}[./-]\d{2}", ln):
             out["firma"] = ln.title()[:60]
             break
     return out
@@ -509,7 +715,7 @@ class TelefonSunucu:
 
     def start(self):
         outer = self
-        kat = "".join(f"<option>{k}</option>" for k in KATEGORILER)
+        kat = '<option value="">Otomatik (fişten)</option>' + "".join(f"<option>{k}</option>" for k in KATEGORILER)
         odm = "".join(f"<option>{k}</option>" for k in ODEMELER)
         page = TELEFON_HTML.replace("%KATEGORI%", kat).replace("%ODEME%", odm).encode("utf-8")
 
@@ -715,51 +921,64 @@ class BulutIs(QRunnable):
 
 # ----------------------------------------------------------------- arka plan OCR
 class OcrIs(QRunnable):
-    def __init__(self, db, fid, bridge):
+    def __init__(self, db, fid, bridge, zorla=False, tara=False, tarama=True):
         super().__init__()
         self.db, self.fid, self.bridge = db, fid, bridge
+        self.zorla, self.tara, self.tarama = zorla, tara, tarama
 
     def run(self):
         row = self.db.get(self.fid)
         if not row:
             return
+        if self.tara and row["dosya"].lower().endswith(IMG_EXT):
+            try:
+                kaynak = orj_yolu(row["dosya"])
+                kaynak = kaynak if os.path.exists(kaynak) else abs_path(row["dosya"])
+                with open(kaynak, "rb") as f:
+                    yeni, orj = gorsel_hazirla(f.read(), True)
+                if not os.path.exists(orj_yolu(row["dosya"])):
+                    os.makedirs(os.path.dirname(orj_yolu(row["dosya"])), exist_ok=True)
+                    with open(orj_yolu(row["dosya"]), "wb") as f:
+                        f.write(orj)
+                with open(abs_path(row["dosya"]), "wb") as f:
+                    f.write(yeni)
+            except Exception as e:
+                log_yaz("tarama_log.txt", f"yeniden tarama: {e!r}")
         text = ocr_metin(abs_path(row["dosya"]))
         if not text:
             self.bridge.ocr_bitti.emit(self.fid)
             return
         p = fis_ayristir(text)
         upd = {"ocr_metin": text}
+        z = self.zorla
         for k in ("firma", "vkn", "belge_no", "plaka"):
-            if p.get(k) and not row[k]:
+            if p.get(k) and (z or not row[k]):
                 upd[k] = p[k]
-        if p.get("tarih") and not row["tarih_kesin"]:
+        if p.get("tarih") and (z or not row["tarih_kesin"]):
             try:
                 od = date.fromisoformat(p["tarih"])
                 if date.today().replace(year=date.today().year - 1) <= od <= date.today():
                     upd["tarih"] = p["tarih"]
             except ValueError:
                 pass
-        if p.get("kategori") and row["kategori"] in ("", "Diğer"):
+        if p.get("kategori") and (z or row["kategori"] in ("", "Diğer")):
             upd["kategori"] = p["kategori"]
-        if p.get("tutar") and not row["tutar"]:
+        if p.get("tutar") and (z or not row["tutar"]):
             upd["tutar"] = p["tutar"]
         tutar = upd.get("tutar", row["tutar"]) or 0
+        if p.get("kdv_orani"):
+            upd["kdv_orani"] = p["kdv_orani"]
         if p.get("kdv"):
             upd["kdv"] = p["kdv"]
         elif tutar:
-            oran = row["kdv_orani"] or 20
+            oran = upd.get("kdv_orani", row["kdv_orani"]) or 20
             upd["kdv"] = round(tutar - tutar / (1 + oran / 100), 2)
         # tarih değiştiyse dosyayı doğru ay klasörüne taşı
         if "tarih" in upd and upd["tarih"][:7] != row["tarih"][:7] and row["dosya"]:
-            src = abs_path(row["dosya"])
-            dst_dir = os.path.join(ROOT, "fisler", upd["tarih"][:7])
-            os.makedirs(dst_dir, exist_ok=True)
-            dst = os.path.join(dst_dir, os.path.basename(src))
             try:
-                shutil.move(src, dst)
-                upd["dosya"] = os.path.relpath(dst, ROOT)
-            except Exception:
-                pass
+                upd["dosya"] = dosya_tasi(row["dosya"], upd["tarih"][:7])
+            except Exception as e:
+                log_yaz("tarama_log.txt", f"taşıma: {e!r}")
         self.db.update(self.fid, **upd)
         self.bridge.ocr_bitti.emit(self.fid)
 
@@ -1421,11 +1640,21 @@ class Main(QMainWindow):
         b_rot.clicked.connect(self.dondur)
         b_open = QPushButton("🔍 Aç")
         b_open.clicked.connect(self.ac)
-        b_ocr = QPushButton("🧾 Fişi Oku (OCR)")
-        b_ocr.clicked.connect(self.ocr_calistir)
+        b_ocr = QPushButton("🧾 Fişi Oku")
+        b_ocr.setToolTip("Fişi tekrar okuyup boş/yanlış alanları doldurur")
+        b_ocr.clicked.connect(lambda: self.ocr_calistir(zorla=True))
+        b_tara = QPushButton("📄 Yeniden Tara")
+        b_tara.setToolTip("Orijinal fotoğraftan fişi tekrar bulup düzleştirir ve okur")
+        b_tara.clicked.connect(lambda: self.ocr_calistir(zorla=True, tara=True))
+        self.b_orj = QPushButton("🖼 Orijinal")
+        self.b_orj.setCheckable(True)
+        self.b_orj.setToolTip("Taranmış hal ile orijinal fotoğraf arasında geçiş")
+        self.b_orj.toggled.connect(self.orj_goster)
         ib.addWidget(b_rot)
         ib.addWidget(b_open)
+        ib.addWidget(b_tara)
         ib.addWidget(b_ocr)
+        ib.addWidget(self.b_orj)
         rl.addLayout(ib)
 
         form = QGridLayout()
@@ -1597,6 +1826,10 @@ class Main(QMainWindow):
         self.f_plaka.setText(r["plaka"] or "")
         self.f_acik.setText(r["aciklama"] or "")
         self.loading = False
+        self.b_orj.blockSignals(True)
+        self.b_orj.setChecked(False)
+        self.b_orj.setEnabled(bool(r["dosya"]) and os.path.exists(orj_yolu(r["dosya"])))
+        self.b_orj.blockSignals(False)
         self.view.set_path(abs_path(r["dosya"]))
 
     def form_temizle(self):
@@ -1621,14 +1854,10 @@ class Main(QMainWindow):
                    kdv_orani=float(self.f_oran.currentText() or 0), kdv=self.f_kdv.value(),
                    odeme=self.f_odeme.currentText(), plaka=self.f_plaka.text().strip().upper(),
                    aciklama=self.f_acik.text().strip())
+        upd["tarih_kesin"] = 1
         if r["dosya"] and yeni_tarih[:7] != r["tarih"][:7]:
-            src = abs_path(r["dosya"])
-            dd = os.path.join(ROOT, "fisler", yeni_tarih[:7])
-            os.makedirs(dd, exist_ok=True)
-            dst = os.path.join(dd, os.path.basename(src))
             try:
-                shutil.move(src, dst)
-                upd["dosya"] = os.path.relpath(dst, ROOT)
+                upd["dosya"] = dosya_tasi(r["dosya"], yeni_tarih[:7])
             except Exception:
                 pass
         self.db.update(self.cur_id, **upd)
@@ -1666,12 +1895,19 @@ class Main(QMainWindow):
         if self.cur_id:
             QDesktopServices.openUrl(QUrl.fromLocalFile(abs_path(self.db.get(self.cur_id)["dosya"])))
 
-    def ocr_calistir(self, fid=None):
+    def ocr_calistir(self, fid=None, zorla=False, tara=False):
         fid = fid or self.cur_id
         if not fid:
             return
-        self.status.setText("🧾 Fiş okunuyor…")
-        self.pool.start(OcrIs(self.db, fid, self.bridge))
+        self.status.setText("📄 Fiş taranıyor ve okunuyor…" if tara else "🧾 Fiş okunuyor… (ilk seferde 10-20 sn sürebilir)")
+        self.pool.start(OcrIs(self.db, fid, self.bridge, zorla=zorla, tara=tara))
+
+    def orj_goster(self, acik):
+        if not self.cur_id:
+            return
+        r = self.db.get(self.cur_id)
+        o = orj_yolu(r["dosya"]) if r and r["dosya"] else ""
+        self.view.set_path(o if acik and o and os.path.exists(o) else abs_path(r["dosya"]))
 
     def ocr_bitti(self, fid):
         r = self.db.get(fid)
@@ -1908,7 +2144,25 @@ class Main(QMainWindow):
         super().closeEvent(e)
 
 
+def ocr_oz_test(img_path, out_path):
+    """Derlenmiş exe'nin tarama+OCR'ı içerdiğini doğrulamak için (CI): gider.exe --ocr-test fis.jpg sonuc.txt"""
+    try:
+        sc, bulundu = belge_tara(Image.open(img_path))
+        p = os.path.join(ROOT, "_ocr_test.jpg")
+        sc.save(p)
+        metin = ocr_metin(p)
+        alan = fis_ayristir(metin)
+        sonuc = f"bulundu={bulundu}\n{json.dumps(alan, ensure_ascii=False)}\n---\n{metin}"
+    except Exception as e:
+        sonuc = f"HATA {e!r}"
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(sonuc)
+
+
 def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == "--ocr-test":
+        ocr_oz_test(sys.argv[2], sys.argv[3])
+        return
     if os.name == "nt":
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Sinetechnic.Gider")
