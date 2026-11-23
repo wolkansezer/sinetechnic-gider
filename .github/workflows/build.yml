@@ -24,6 +24,9 @@ jobs:
           python -m pip install PySide6 openpyxl Pillow reportlab qrcode pypdf pillow-heif pyinstaller winocr opencv-python-headless rapidocr_onnxruntime
       - name: OCR testi
         shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
         run: python tests/ocr_test.py
       - name: EXE derle
         shell: pwsh
