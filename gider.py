@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
                                QWidget)
 
 APP_NAME = "SİNETECHNİC GİDER"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 OWNER = "Volkan Sezer"
 WEBSITE = "https://www.sinetechnic.com"
 EMAIL = "volkan.sezer@sinetechnic.com"
@@ -148,6 +148,7 @@ DEFAULT_SETTINGS = {
     "telefon_sayfa": "https://wolkansezer.github.io/sinetechnic-gider/",
     "bulut_aralik_sn": 60,
     "teslim_gunu": 14,
+    "pdf_kolon": 3,
     "otomatik_gonder": True,
     "otomatik_gun": 10,
     "son_oto_deneme": "",
@@ -984,175 +985,165 @@ class OcrIs(QRunnable):
 
 
 # ----------------------------------------------------------------- muhasebeci paketi
-def paket_olustur(db, ym, settings, rows=None, ek_no=0):
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.utils import ImageReader
+def yakit_mi(r):
+    return (r["kategori"] or "") == "Akaryakıt"
+
+
+def sira_kodlari(tum):
+    """Ayın tüm fişlerine tarih sırasına göre kod verir: akaryakıt Y-01.., diğerleri G-01.."""
+    kod, y, g = {}, 0, 0
+    for r in sorted(tum, key=lambda r: (r["tarih"], r["id"])):
+        if yakit_mi(r):
+            y += 1
+            kod[r["id"]] = f"Y-{y:02d}"
+        else:
+            g += 1
+            kod[r["id"]] = f"G-{g:02d}"
+    return kod
+
+
+def _gruplar(rows):
+    s = sorted(rows, key=lambda r: (r["tarih"], r["id"]))
+    return [("AKARYAKIT FİŞLERİ", [r for r in s if yakit_mi(r)]),
+            ("DİĞER GİDER FİŞLERİ", [r for r in s if not yakit_mi(r)])]
+
+
+def _pdf_font():
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-    from reportlab.pdfgen import canvas
-
-    tum = db.month(ym)
-    sira = {r["id"]: i for i, r in enumerate(tum, 1)}
-    rows = list(rows) if rows is not None else tum
-    if not rows:
-        raise ValueError("Bu ayda gönderilecek fiş yok.")
-    firma = guvenli_ad(settings.get("firma", "FIRMA"), 20)
-    ek_etiket = f" - EK {ek_no}" if ek_no else ""
-    out_dir = os.path.join(ROOT, "paketler", ym + (f"_EK{ek_no}" if ek_no else ""))
-    if os.path.isdir(out_dir):
-        shutil.rmtree(out_dir, ignore_errors=True)
-    belge_dir = os.path.join(out_dir, "belgeler")
-    os.makedirs(belge_dir, exist_ok=True)
-
-    # belgeleri sıralı adlandırarak kopyala
-    kopyalar = []
-    for r in rows:
-        i = sira.get(r["id"], 0)
-        src = abs_path(r["dosya"])
-        if src and os.path.exists(src):
-            ext = os.path.splitext(src)[1]
-            tut = f"{(r['tutar'] or 0):.2f}".replace(".", ",")
-            ad = f"{i:03d}_{r['tarih']}_{guvenli_ad(r['firma'], 25)}_{tut}TL{ext}"
-            dst = os.path.join(belge_dir, ad)
-            shutil.copy2(src, dst)
-            kopyalar.append((i, r, dst))
-        else:
-            kopyalar.append((i, r, None))
-
-    # Excel
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Gider Listesi"
-    baslik = f"{settings.get('firma', '')} — {ay_adi(ym)} Gider Listesi{ek_etiket}"
-    ws.append([baslik])
-    ws.merge_cells("A1:N1")
-    ws["A1"].font = Font(bold=True, size=14, color="FFFFFF")
-    ws["A1"].fill = PatternFill("solid", fgColor="121C30")
-    ws["A1"].alignment = Alignment(horizontal="center")
-    hdr = ["Sıra", "Tarih", "Belge Türü", "Belge No", "Firma / Satıcı", "VKN/TCKN",
-           "Kategori", "Matrah", "KDV %", "KDV Tutarı", "Toplam", "Ödeme", "Plaka", "Açıklama"]
-    ws.append(hdr)
-    thin = Side(style="thin", color="BFC7D5")
-    for c in ws[2]:
-        c.font = Font(bold=True, color="FFFFFF")
-        c.fill = PatternFill("solid", fgColor="FF7A1A")
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        c.border = Border(top=thin, bottom=thin, left=thin, right=thin)
-    for r in rows:
-        i = sira.get(r["id"], 0)
-        matrah = round((r["tutar"] or 0) - (r["kdv"] or 0), 2)
-        ws.append([i, datetime.strptime(r["tarih"], "%Y-%m-%d").date(), r["belge_turu"], r["belge_no"],
-                   r["firma"], r["vkn"], r["kategori"], matrah, (r["kdv_orani"] or 0) / 100,
-                   r["kdv"] or 0, r["tutar"] or 0, r["odeme"], r["plaka"], r["aciklama"]])
-    last = ws.max_row
-    ws.append(["", "", "", "", "TOPLAM", "", "", f"=SUM(H3:H{last})", "",
-               f"=SUM(J3:J{last})", f"=SUM(K3:K{last})"])
-    for c in ws[ws.max_row]:
-        c.font = Font(bold=True)
-        c.fill = PatternFill("solid", fgColor="E8EDF5")
-    for row in ws.iter_rows(min_row=3, max_row=ws.max_row):
-        for c in row:
-            c.border = Border(top=thin, bottom=thin, left=thin, right=thin)
-        row[1].number_format = "DD.MM.YYYY"
-        row[8].number_format = "0%"
-        for idx in (7, 9, 10):
-            row[idx].number_format = '#,##0.00 "₺"'
-    widths = [6, 12, 15, 14, 32, 13, 22, 13, 8, 13, 14, 13, 11, 30]
-    for i, w in enumerate(widths):
-        ws.column_dimensions[chr(65 + i)].width = w
-    ws.freeze_panes = "A3"
-
-    ws2 = wb.create_sheet("Özet")
-    ws2.append(["Kategori", "Adet", "KDV", "Toplam"])
-    kat = {}
-    for r in rows:
-        k = kat.setdefault(r["kategori"], [0, 0.0, 0.0])
-        k[0] += 1
-        k[1] += r["kdv"] or 0
-        k[2] += r["tutar"] or 0
-    for k, v in sorted(kat.items()):
-        ws2.append([k, v[0], round(v[1], 2), round(v[2], 2)])
-    ws2.append([])
-    ws2.append(["KDV Oranı", "Adet", "KDV", "Toplam"])
-    oran = {}
-    for r in rows:
-        o = oran.setdefault(f"%{r['kdv_orani']:g}", [0, 0.0, 0.0])
-        o[0] += 1
-        o[1] += r["kdv"] or 0
-        o[2] += r["tutar"] or 0
-    for k, v in sorted(oran.items()):
-        ws2.append([k, v[0], round(v[1], 2), round(v[2], 2)])
-    for c in ("A", "B", "C", "D"):
-        ws2.column_dimensions[c].width = 26
-    for row in ws2.iter_rows():
-        if row[0].value in ("Kategori", "KDV Oranı"):
-            for c in row:
-                c.font = Font(bold=True, color="FFFFFF")
-                c.fill = PatternFill("solid", fgColor="121C30")
-        else:
-            for c in row[2:]:
-                c.number_format = '#,##0.00 "₺"'
-    ek_dosya = f"_EK{ek_no}" if ek_no else ""
-    xlsx = os.path.join(out_dir, f"{ym}_{firma}_Gider_Listesi{ek_dosya}.xlsx")
-    wb.save(xlsx)
-
-    # Birleşik PDF (fotoğraflı fişler, sayfa başına bir belge)
-    font = "Helvetica"
-    for fp in (r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\segoeui.ttf",
-               "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+    for ad, fp in (("TRFont", r"C:\Windows\Fonts\arial.ttf"), ("TRFont", r"C:\Windows\Fonts\segoeui.ttf"),
+                   ("TRFont", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")):
         if os.path.exists(fp):
             try:
-                pdfmetrics.registerFont(TTFont("TRFont", fp))
-                font = "TRFont"
-                break
+                pdfmetrics.registerFont(TTFont(ad, fp))
+                b = fp.replace("arial.ttf", "arialbd.ttf").replace("segoeui.ttf", "segoeuib.ttf").replace(
+                    "DejaVuSans.ttf", "DejaVuSans-Bold.ttf")
+                if os.path.exists(b):
+                    pdfmetrics.registerFont(TTFont(ad + "B", b))
+                    return ad, ad + "B"
+                return ad, ad
             except Exception:
                 pass
-    pdf = os.path.join(out_dir, f"{ym}_{firma}_Fisler{ek_dosya}.pdf")
-    c = canvas.Canvas(pdf, pagesize=A4)
+    return "Helvetica", "Helvetica-Bold"
+
+
+def fis_pdf_olustur(pdf, baslik, alt_baslik, gruplar, kod, belge_yolu, kolon=3):
+    """Fişleri tarih sırasıyla, sayfada yan yana (soldan sağa, satır satır) dizer.
+    Her grup (akaryakıt / diğer) yeni sayfadan başlar."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    F, FB = _pdf_font()
     W, H = A4
-    c.setFont(font, 18)
-    c.drawString(40, H - 60, f"{settings.get('firma', '')}")
-    c.setFont(font, 14)
-    c.drawString(40, H - 85, f"{ay_adi(ym)} — Gider Belgeleri{ek_etiket}")
-    c.setFont(font, 10)
-    toplam = sum((r["tutar"] or 0) for r in rows)
-    kdv_t = sum((r["kdv"] or 0) for r in rows)
-    c.drawString(40, H - 110, f"Belge sayısı: {len(rows)}    Toplam: {tl(toplam)}    KDV: {tl(kdv_t)}")
-    y = H - 140
-    for r in rows:
-        i = sira.get(r["id"], 0)
-        if y < 50:
+    M, GAP, CAP = 18, 10, 22          # kenar boşluğu, sütun arası, başlık yüksekliği
+    col_w = (W - 2 * M - GAP * (kolon - 1)) / kolon
+    c = canvas.Canvas(pdf, pagesize=A4)
+    c.setTitle(baslik)
+
+    # --- 1. sayfa: özet ve liste
+    hepsi = [r for _, g in gruplar for r in g]
+    c.setFont(FB, 17)
+    c.drawString(40, H - 55, baslik)
+    c.setFont(F, 12)
+    c.drawString(40, H - 75, alt_baslik)
+    y = H - 105
+    for ad, g in gruplar:
+        if not g:
+            continue
+        if y < 90:
             c.showPage()
-            c.setFont(font, 10)
             y = H - 50
-        c.drawString(40, y, f"{i:03d}  {r['tarih'][8:10]}.{r['tarih'][5:7]}.{r['tarih'][:4]}  "
-                            f"{(r['firma'] or '-')[:38]:<38}  {r['kategori'][:18]:<18}  {tl(r['tutar'] or 0)}")
-        y -= 15
+        top = sum(r["tutar"] or 0 for r in g)
+        kdv = sum(r["kdv"] or 0 for r in g)
+        c.setFillColorRGB(1, 0.48, 0.1)
+        c.rect(36, y - 4, W - 72, 18, fill=1, stroke=0)
+        c.setFillColorRGB(1, 1, 1)
+        c.setFont(FB, 10)
+        c.drawString(42, y + 1, f"{ad}  —  {len(g)} adet  ·  Toplam {tl(top)}  ·  KDV {tl(kdv)}")
+        c.setFillColorRGB(0, 0, 0)
+        y -= 20
+        c.setFont(F, 9)
+        for r in g:
+            if y < 40:
+                c.showPage()
+                c.setFont(F, 9)
+                y = H - 50
+            c.drawString(42, y, kod.get(r["id"], ""))
+            c.drawString(85, y, f"{r['tarih'][8:10]}.{r['tarih'][5:7]}.{r['tarih'][:4]}")
+            c.drawString(145, y, (r["firma"] or "-")[:34])
+            c.drawString(330, y, (r["plaka"] or "")[:10])
+            c.drawRightString(470, y, f"KDV {tl(r['kdv'] or 0)}")
+            c.drawRightString(W - 42, y, tl(r["tutar"] or 0))
+            y -= 13
+        y -= 12
+    c.setFont(FB, 10)
+    c.drawRightString(W - 42, max(y, 30), f"GENEL TOPLAM: {tl(sum(r['tutar'] or 0 for r in hepsi))}   "
+                                          f"KDV: {tl(sum(r['kdv'] or 0 for r in hepsi))}")
     c.showPage()
+
+    # --- fiş sayfaları: yan yana
     pdf_ekleri = []
-    for i, r, dst in kopyalar:
-        if not dst:
+    for ad, g in gruplar:
+        resimli = []
+        for r in g:
+            p = belge_yolu.get(r["id"])
+            if not p:
+                continue
+            if p.lower().endswith(".pdf"):
+                pdf_ekleri.append(p)
+            else:
+                resimli.append((r, p))
+        if not resimli:
             continue
-        if dst.lower().endswith(".pdf"):
-            pdf_ekleri.append(dst)
-            continue
-        c.setFont(font, 11)
-        c.drawString(30, H - 30, f"No {i:03d} | {r['tarih']} | {(r['firma'] or '-')[:40]} | "
-                                 f"{tl(r['tutar'] or 0)} | {r['kategori']}")
-        try:
-            img = ImageReader(dst)
-            iw, ih = img.getSize()
-            maxw, maxh = W - 60, H - 80
-            sc = min(maxw / iw, maxh / ih)
-            c.drawImage(img, (W - iw * sc) / 2, (H - 45 - ih * sc), iw * sc, ih * sc)
-        except Exception as e:
-            c.drawString(30, H - 60, f"Görsel eklenemedi: {e}")
+
+        def sayfa_basi(devam=False):
+            c.setFillColorRGB(0.07, 0.11, 0.19)
+            c.rect(0, H - 26, W, 26, fill=1, stroke=0)
+            c.setFillColorRGB(1, 1, 1)
+            c.setFont(FB, 11)
+            c.drawString(M, H - 17, f"{ad}{' (devam)' if devam else ''}")
+            c.setFont(F, 9)
+            c.drawRightString(W - M, H - 17, alt_baslik)
+            c.setFillColorRGB(0, 0, 0)
+            return H - 26 - 8
+
+        y_top = sayfa_basi()
+        i = 0
+        while i < len(resimli):
+            satir = resimli[i:i + kolon]
+            boyut = []
+            for r, p in satir:
+                try:
+                    ir = ImageReader(p)
+                    iw, ih = ir.getSize()
+                    boyut.append((ir, iw, ih))
+                except Exception:
+                    boyut.append((None, 1, 1))
+            max_img_h = y_top - M - CAP
+            olcek = [min(col_w / iw, (H - 26 - 8 - M - CAP) / ih) for _, iw, ih in boyut]
+            row_h = max(ih * s for (_, iw, ih), s in zip(boyut, olcek)) + CAP
+            if row_h > y_top - M and y_top < H - 40:
+                c.showPage()
+                y_top = sayfa_basi(True)
+                continue
+            for k, ((r, p), (ir, iw, ih), s) in enumerate(zip(satir, boyut, olcek)):
+                x = M + k * (col_w + GAP)
+                c.setFont(FB, 8.5)
+                c.drawString(x, y_top - 9, f"{kod.get(r['id'], '')}  {r['tarih'][8:10]}.{r['tarih'][5:7]}.{r['tarih'][:4]}")
+                c.drawRightString(x + col_w, y_top - 9, tl(r["tutar"] or 0))
+                c.setFont(F, 7.5)
+                c.drawString(x, y_top - 18, (r["firma"] or "-")[:38])
+                if ir is not None:
+                    w_, h_ = iw * s, ih * s
+                    c.drawImage(ir, x + (col_w - w_) / 2, y_top - CAP - h_, w_, h_)
+                    c.setStrokeColorRGB(0.8, 0.8, 0.8)
+                    c.rect(x + (col_w - w_) / 2, y_top - CAP - h_, w_, h_, fill=0, stroke=1)
+            y_top -= row_h + 10
+            i += kolon
         c.showPage()
     c.save()
 
-    # PDF belgeleri (e-arşiv) birleşik PDF'e ekle
     if pdf_ekleri:
         try:
             from pypdf import PdfReader, PdfWriter  # type: ignore
@@ -1164,19 +1155,167 @@ def paket_olustur(db, ym, settings, rows=None, ek_no=0):
             with open(tmp, "wb") as f:
                 w.write(f)
             os.replace(tmp, pdf)
-        except Exception:
-            pass
+        except Exception as e:
+            log_yaz("tarama_log.txt", f"PDF birleştirme: {e!r}")
 
-    # ZIP
+
+def paket_olustur(db, ym, settings, rows=None, ek_no=0):
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+    tum = db.month(ym)
+    kod = sira_kodlari(tum)
+    rows = list(rows) if rows is not None else tum
+    if not rows:
+        raise ValueError("Bu ayda gönderilecek fiş yok.")
+    gruplar = _gruplar(rows)
+    sirali = [r for _, g in gruplar for r in g]
+    firma = guvenli_ad(settings.get("firma", "FIRMA"), 20)
+    ek_etiket = f" - EK {ek_no}" if ek_no else ""
+    ek_dosya = f"_EK{ek_no}" if ek_no else ""
+    out_dir = os.path.join(ROOT, "paketler", ym + ek_dosya)
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir, ignore_errors=True)
+    belge_dir = os.path.join(out_dir, "belgeler")
+    os.makedirs(belge_dir, exist_ok=True)
+
+    # belgeleri grup + tarih sırasıyla adlandırarak kopyala
+    belge_yolu = {}
+    for r in sirali:
+        src = abs_path(r["dosya"])
+        if src and os.path.exists(src):
+            ext = os.path.splitext(src)[1]
+            tut = f"{(r['tutar'] or 0):.2f}".replace(".", ",")
+            alt = "akaryakit" if yakit_mi(r) else "diger"
+            os.makedirs(os.path.join(belge_dir, alt), exist_ok=True)
+            dst = os.path.join(belge_dir, alt,
+                               f"{kod[r['id']]}_{r['tarih']}_{guvenli_ad(r['firma'], 25)}_{tut}TL{ext}")
+            shutil.copy2(src, dst)
+            belge_yolu[r["id"]] = dst
+
+    # ---------------- Excel
+    thin = Side(style="thin", color="BFC7D5")
+    kenar = Border(top=thin, bottom=thin, left=thin, right=thin)
+    hdr = ["Sıra", "Tarih", "Belge Türü", "Belge No", "Firma / Satıcı", "VKN/TCKN",
+           "Kategori", "Matrah", "KDV %", "KDV Tutarı", "Toplam", "Ödeme", "Plaka", "Açıklama"]
+    widths = [7, 12, 15, 14, 32, 13, 22, 13, 8, 13, 14, 13, 11, 30]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Gider Listesi"
+    ws.append([f"{settings.get('firma', '')} — {ay_adi(ym)} Gider Listesi{ek_etiket}"])
+    ws.merge_cells("A1:N1")
+    ws["A1"].font = Font(bold=True, size=14, color="FFFFFF")
+    ws["A1"].fill = PatternFill("solid", fgColor="121C30")
+    ws["A1"].alignment = Alignment(horizontal="center")
+    ara_toplam_satir = []
+
+    def tablo(sayfa, ad, g):
+        sayfa.append([])
+        sayfa.append([f"{ad} ({len(g)} adet)"])
+        sayfa.cell(sayfa.max_row, 1).font = Font(bold=True, size=12, color="121C30")
+        sayfa.append(hdr)
+        for cc in sayfa[sayfa.max_row]:
+            cc.font = Font(bold=True, color="FFFFFF")
+            cc.fill = PatternFill("solid", fgColor="FF7A1A")
+            cc.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cc.border = kenar
+        ilk = sayfa.max_row + 1
+        for r in g:
+            matrah = round((r["tutar"] or 0) - (r["kdv"] or 0), 2)
+            sayfa.append([kod[r["id"]], datetime.strptime(r["tarih"], "%Y-%m-%d").date(), r["belge_turu"],
+                          r["belge_no"], r["firma"], r["vkn"], r["kategori"], matrah, (r["kdv_orani"] or 0) / 100,
+                          r["kdv"] or 0, r["tutar"] or 0, r["odeme"], r["plaka"], r["aciklama"]])
+        son = sayfa.max_row
+        sayfa.append(["", "", "", "", f"{ad} TOPLAM", "", "", f"=SUM(H{ilk}:H{son})", "",
+                      f"=SUM(J{ilk}:J{son})", f"=SUM(K{ilk}:K{son})"])
+        for cc in sayfa[sayfa.max_row]:
+            cc.font = Font(bold=True)
+            cc.fill = PatternFill("solid", fgColor="E8EDF5")
+        for row in sayfa.iter_rows(min_row=ilk, max_row=sayfa.max_row):
+            for cc in row:
+                cc.border = kenar
+            row[1].number_format = "DD.MM.YYYY"
+            row[8].number_format = "0%"
+            for idx in (7, 9, 10):
+                row[idx].number_format = '#,##0.00 "₺"'
+        return sayfa.max_row
+
+    for ad, g in gruplar:
+        if g:
+            ara_toplam_satir.append(tablo(ws, ad, g))
+    ws.append([])
+    if ara_toplam_satir:
+        ws.append(["", "", "", "", "GENEL TOPLAM", "", "",
+                   "=" + "+".join(f"H{x}" for x in ara_toplam_satir), "",
+                   "=" + "+".join(f"J{x}" for x in ara_toplam_satir),
+                   "=" + "+".join(f"K{x}" for x in ara_toplam_satir)])
+        for cc in ws[ws.max_row]:
+            cc.font = Font(bold=True, color="FFFFFF")
+            cc.fill = PatternFill("solid", fgColor="121C30")
+        for idx in (7, 9, 10):
+            ws[ws.max_row][idx].number_format = '#,##0.00 "₺"'
+    for i, w in enumerate(widths):
+        ws.column_dimensions[chr(65 + i)].width = w
+
+    # ayrı sayfalar: Akaryakıt ve Diğer
+    for ad, g in gruplar:
+        if g:
+            sh = wb.create_sheet("Akaryakıt" if ad.startswith("AKARYAKIT") else "Diğer")
+            tablo(sh, ad, g)
+            for i, w in enumerate(widths):
+                sh.column_dimensions[chr(65 + i)].width = w
+
+    ws2 = wb.create_sheet("Özet")
+    ws2.append(["Kategori", "Adet", "KDV", "Toplam"])
+    kat = {}
+    for r in sirali:
+        k = kat.setdefault(r["kategori"], [0, 0.0, 0.0])
+        k[0] += 1
+        k[1] += r["kdv"] or 0
+        k[2] += r["tutar"] or 0
+    for k, v in sorted(kat.items()):
+        ws2.append([k, v[0], round(v[1], 2), round(v[2], 2)])
+    ws2.append([])
+    ws2.append(["KDV Oranı", "Adet", "KDV", "Toplam"])
+    oran = {}
+    for r in sirali:
+        o = oran.setdefault(f"%{(r['kdv_orani'] or 0):g}", [0, 0.0, 0.0])
+        o[0] += 1
+        o[1] += r["kdv"] or 0
+        o[2] += r["tutar"] or 0
+    for k, v in sorted(oran.items()):
+        ws2.append([k, v[0], round(v[1], 2), round(v[2], 2)])
+    for cl in ("A", "B", "C", "D"):
+        ws2.column_dimensions[cl].width = 26
+    for row in ws2.iter_rows():
+        if row[0].value in ("Kategori", "KDV Oranı"):
+            for cc in row:
+                cc.font = Font(bold=True, color="FFFFFF")
+                cc.fill = PatternFill("solid", fgColor="121C30")
+        else:
+            for cc in row[2:]:
+                cc.number_format = '#,##0.00 "₺"'
+    xlsx = os.path.join(out_dir, f"{ym}_{firma}_Gider_Listesi{ek_dosya}.xlsx")
+    wb.save(xlsx)
+
+    # ---------------- PDF: fişler tarih sırasıyla yan yana, akaryakıt ayrı bölüm
+    pdf = os.path.join(out_dir, f"{ym}_{firma}_Fisler{ek_dosya}.pdf")
+    fis_pdf_olustur(pdf, f"{settings.get('firma', '')} — Gider Belgeleri",
+                    f"{ay_adi(ym)}{ek_etiket}", gruplar, kod, belge_yolu,
+                    kolon=int(settings.get("pdf_kolon", 3)))
+
     zp = os.path.join(out_dir, f"{ym}_{firma}_Gider_Paketi{ek_dosya}.zip")
     with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(xlsx, os.path.basename(xlsx))
         z.write(pdf, os.path.basename(pdf))
-        for _, _, dst in kopyalar:
-            if dst:
-                z.write(dst, "belgeler/" + os.path.basename(dst))
+        for dst in belge_yolu.values():
+            z.write(dst, os.path.relpath(dst, out_dir).replace(os.sep, "/"))
+    toplam = sum((r["tutar"] or 0) for r in sirali)
+    kdv_t = sum((r["kdv"] or 0) for r in sirali)
+    yakit = sum((r["tutar"] or 0) for r in sirali if yakit_mi(r))
     return {"klasor": out_dir, "xlsx": xlsx, "pdf": pdf, "zip": zp, "ek_no": ek_no,
-            "adet": len(rows), "toplam": toplam, "kdv": kdv_t}
+            "adet": len(sirali), "toplam": toplam, "kdv": kdv_t, "yakit": yakit,
+            "yakit_adet": sum(1 for r in sirali if yakit_mi(r))}
 
 
 def eposta_gonder(settings, paket, ym, ekler):
@@ -1197,9 +1336,11 @@ def eposta_gonder(settings, paket, ym, ekler):
         f"Merhaba {hitap},\n\n{ay_adi(ym)} ayına ait gider belgeleri ektedir."
         + (f" Bu gönderim daha önce iletilen paketin EK {ek} belgeleridir (sonradan ulaşan fişler)." if ek else "")
         + f"\nSon teslim tarihi: {teslim_tarihi(ym, int(settings.get('teslim_gunu', 14))):%d.%m.%Y}\n\n"
-        f"Belge sayısı : {paket['adet']}\nToplam tutar : {tl(paket['toplam'])}\n"
+        f"Belge sayısı : {paket['adet']} (akaryakıt {paket.get('yakit_adet', 0)} adet, {tl(paket.get('yakit', 0))})\n"
+        f"Toplam tutar : {tl(paket['toplam'])}\n"
         f"Toplam KDV   : {tl(paket['kdv'])}\n\n"
-        f"Ekler: Excel gider listesi ve tarihe göre sıralı birleşik PDF.\n\n"
+        f"Ekler: Excel gider listesi ve fişlerin tarih sırasıyla dizildiği PDF "
+        f"(akaryakıt fişleri ayrı bölümde, Y- kodlu; diğerleri G- kodlu).\n\n"
         f"İyi çalışmalar,\n{settings.get('firma', '')}\n\n-- {APP_NAME} ile gönderilmiştir.")
     toplam_boyut = 0
     for p in ekler:
@@ -1387,6 +1528,11 @@ class AyarlarDialog(QDialog):
         f.addRow("Muhasebeci son teslim:", self.teslim)
         f.addRow("", self.oto)
         f.addRow("Otomatik gönderim günü:", self.otogun)
+        self.kolon = QSpinBox()
+        self.kolon.setRange(2, 5)
+        self.kolon.setValue(int(s.get("pdf_kolon", 3)))
+        self.kolon.setSuffix(" fiş yan yana")
+        f.addRow("PDF'te bir satırda:", self.kolon)
         f.addRow(QLabel("<b>☁ GitHub (her yerden telefonla ekleme)</b>"))
         self.gh_repo = QLineEdit(s.get("github_repo", ""))
         self.gh_tok = QLineEdit(gh_anahtar(s))
@@ -1431,6 +1577,7 @@ class AyarlarDialog(QDialog):
         s["otomatik_ocr"] = self.ocr.isChecked()
         s["tarama_modu"] = self.tarama.isChecked()
         s["teslim_gunu"] = self.teslim.value()
+        s["pdf_kolon"] = self.kolon.value()
         s["otomatik_gonder"] = self.oto.isChecked()
         s["otomatik_gun"] = min(self.otogun.value(), self.teslim.value())
         s["github_repo"] = self.gh_repo.text().strip()
@@ -1508,7 +1655,7 @@ class ImageView(QScrollArea):
 
 
 class Main(QMainWindow):
-    COLS = ["No", "Tarih", "Firma", "Kategori", "Tutar", "KDV", "Ödeme", "Plaka", "Durum"]
+    COLS = ["Sıra", "Tarih", "Firma", "Kategori", "Tutar", "KDV", "Ödeme", "Plaka", "Durum"]
 
     def __init__(self):
         super().__init__()
@@ -1774,6 +1921,7 @@ class Main(QMainWindow):
                             f"{'açık' if self.sunucu.httpd else 'kapalı'}{port_ok}   ·   ☁ Bulut: {self.bulut_txt}")
 
     def tablo_doldur(self):
+        self.kodlar = sira_kodlari(self.rows)
         q = self.ara.text().strip().lower()
         rows = [r for r in self.rows if not q or q in " ".join(
             str(r[k] or "") for k in ("firma", "plaka", "aciklama", "kategori", "belge_no")).lower()]
@@ -1782,7 +1930,7 @@ class Main(QMainWindow):
         for i, r in enumerate(rows):
             eksik = not r["tutar"] or not r["firma"]
             durum = "✅ Gönderildi" if r["gonderildi"] else ("⚠ Eksik bilgi" if eksik else "Bekliyor")
-            vals = [str(self.rows.index(r) + 1), datetime.strptime(r["tarih"], "%Y-%m-%d").strftime("%d.%m.%Y"),
+            vals = [self.kodlar.get(r["id"], ""), datetime.strptime(r["tarih"], "%Y-%m-%d").strftime("%d.%m.%Y"),
                     r["firma"] or "—", r["kategori"], tl(r["tutar"] or 0), tl(r["kdv"] or 0),
                     r["odeme"], r["plaka"], durum]
             for j, v in enumerate(vals):
