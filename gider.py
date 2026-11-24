@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
                                QWidget)
 
 APP_NAME = "SİNETECHNİC GİDER"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 OWNER = "Volkan Sezer"
 WEBSITE = "https://www.sinetechnic.com"
 EMAIL = "volkan.sezer@sinetechnic.com"
@@ -639,6 +639,12 @@ def fis_ayristir(text):
     if m:
         out["plaka"] = m.group(1).replace(" ", "")
 
+    if re.search(r"E-?\s?ARS[I1]V\s*FATURA", up):
+        out["belge_turu"] = "e-Arşiv Fatura"
+    elif re.search(r"E-?\s?FATURA", up):
+        out["belge_turu"] = "e-Fatura"
+    elif re.search(r"\bFATURA\b", up) and not re.search(r"FATURA\s+YERINE", up):
+        out["belge_turu"] = "Kağıt Fatura"
     for kat, pat in KATEGORI_KELIME:
         if re.search(pat, up):
             out["kategori"] = kat
@@ -952,6 +958,8 @@ class OcrIs(QRunnable):
         p = fis_ayristir(text)
         upd = {"ocr_metin": text}
         z = self.zorla
+        if p.get("belge_turu") and (z or row["belge_turu"] in ("", "ÖKC Fişi")):
+            upd["belge_turu"] = p["belge_turu"]
         for k in ("firma", "vkn", "belge_no", "plaka"):
             if p.get(k) and (z or not row[k]):
                 upd[k] = p[k]
@@ -1082,52 +1090,61 @@ def fis_pdf_olustur(pdf, baslik, alt_baslik, gruplar, kod, belge_yolu, kolon=3):
                                           f"KDV: {tl(sum(r['kdv'] or 0 for r in hepsi))}")
     c.showPage()
 
-    # --- fiş sayfaları: yan yana
-    pdf_ekleri = []
+    # --- belge sayfaları: fişler yan yana, faturalar tam sayfa (tarih sırası korunur)
+    araya_pdf = []          # (kaç sayfadan sonra, pdf yolu)
+    tamamlanan = lambda: c.getPageNumber() - 1  # noqa: E731
+
+    def baslik_cubugu(ad, devam=False):
+        c.setFillColorRGB(0.07, 0.11, 0.19)
+        c.rect(0, H - 26, W, 26, fill=1, stroke=0)
+        c.setFillColorRGB(1, 1, 1)
+        c.setFont(FB, 11)
+        c.drawString(M, H - 17, f"{ad}{' (devam)' if devam else ''}")
+        c.setFont(F, 9)
+        c.drawRightString(W - M, H - 17, alt_baslik)
+        c.setFillColorRGB(0, 0, 0)
+        return H - 26 - 8
+
+    def tam_sayfa(ad, r, p):
+        try:
+            ir = ImageReader(p)
+            iw, ih = ir.getSize()
+        except Exception:
+            return
+        baslik_cubugu(ad)
+        c.setFont(FB, 10)
+        c.drawString(M, H - 42, f"{kod.get(r['id'], '')}  {r['tarih'][8:10]}.{r['tarih'][5:7]}.{r['tarih'][:4]}  "
+                                f"{(r['firma'] or '-')[:60]}")
+        c.drawRightString(W - M, H - 42, tl(r["tutar"] or 0))
+        ust = H - 50
+        s = min((W - 2 * M) / iw, (ust - M) / ih)
+        w_, h_ = iw * s, ih * s
+        c.drawImage(ir, (W - w_) / 2, ust - h_, w_, h_)
+        c.showPage()
+
     for ad, g in gruplar:
-        resimli = []
-        for r in g:
-            p = belge_yolu.get(r["id"])
-            if not p:
-                continue
-            if p.lower().endswith(".pdf"):
-                pdf_ekleri.append(p)
-            else:
-                resimli.append((r, p))
-        if not resimli:
+        if not g:
             continue
+        satir_bekleyen = []
+        y_top = None
 
-        def sayfa_basi(devam=False):
-            c.setFillColorRGB(0.07, 0.11, 0.19)
-            c.rect(0, H - 26, W, 26, fill=1, stroke=0)
-            c.setFillColorRGB(1, 1, 1)
-            c.setFont(FB, 11)
-            c.drawString(M, H - 17, f"{ad}{' (devam)' if devam else ''}")
-            c.setFont(F, 9)
-            c.drawRightString(W - M, H - 17, alt_baslik)
-            c.setFillColorRGB(0, 0, 0)
-            return H - 26 - 8
-
-        y_top = sayfa_basi()
-        i = 0
-        while i < len(resimli):
-            satir = resimli[i:i + kolon]
+        def satir_bas(liste, y_top):
             boyut = []
-            for r, p in satir:
+            for r, p in liste:
                 try:
                     ir = ImageReader(p)
                     iw, ih = ir.getSize()
                     boyut.append((ir, iw, ih))
                 except Exception:
                     boyut.append((None, 1, 1))
-            max_img_h = y_top - M - CAP
             olcek = [min(col_w / iw, (H - 26 - 8 - M - CAP) / ih) for _, iw, ih in boyut]
             row_h = max(ih * s for (_, iw, ih), s in zip(boyut, olcek)) + CAP
-            if row_h > y_top - M and y_top < H - 40:
+            if y_top is None:
+                y_top = baslik_cubugu(ad)
+            elif row_h > y_top - M:
                 c.showPage()
-                y_top = sayfa_basi(True)
-                continue
-            for k, ((r, p), (ir, iw, ih), s) in enumerate(zip(satir, boyut, olcek)):
+                y_top = baslik_cubugu(ad, True)
+            for k, ((r, p), (ir, iw, ih), s) in enumerate(zip(liste, boyut, olcek)):
                 x = M + k * (col_w + GAP)
                 c.setFont(FB, 8.5)
                 c.drawString(x, y_top - 9, f"{kod.get(r['id'], '')}  {r['tarih'][8:10]}.{r['tarih'][5:7]}.{r['tarih'][:4]}")
@@ -1139,24 +1156,74 @@ def fis_pdf_olustur(pdf, baslik, alt_baslik, gruplar, kod, belge_yolu, kolon=3):
                     c.drawImage(ir, x + (col_w - w_) / 2, y_top - CAP - h_, w_, h_)
                     c.setStrokeColorRGB(0.8, 0.8, 0.8)
                     c.rect(x + (col_w - w_) / 2, y_top - CAP - h_, w_, h_, fill=0, stroke=1)
-            y_top -= row_h + 10
-            i += kolon
-        c.showPage()
+            return y_top - row_h - 10
+
+        def sayfayi_kapat():
+            nonlocal y_top, satir_bekleyen
+            if satir_bekleyen:
+                y_top = satir_bas(satir_bekleyen, y_top)
+                satir_bekleyen = []
+            if y_top is not None:
+                c.showPage()
+                y_top = None
+
+        for r in g:
+            p = belge_yolu.get(r["id"])
+            if not p:
+                continue
+            if fatura_mi(r, p):
+                sayfayi_kapat()
+                if p.lower().endswith(".pdf"):
+                    araya_pdf.append((tamamlanan(), p))
+                else:
+                    tam_sayfa(ad, r, p)
+                continue
+            satir_bekleyen.append((r, p))
+            if len(satir_bekleyen) == kolon:
+                y_top = satir_bas(satir_bekleyen, y_top)
+                satir_bekleyen = []
+        sayfayi_kapat()
     c.save()
 
-    if pdf_ekleri:
+    if araya_pdf:
         try:
             from pypdf import PdfReader, PdfWriter  # type: ignore
+            ana = PdfReader(pdf)
             w = PdfWriter()
-            for p in [pdf] + pdf_ekleri:
-                for pg in PdfReader(p).pages:
-                    w.add_page(pg)
+            sira_ = sorted(araya_pdf, key=lambda x: x[0])
+            j = 0
+            for idx, pg in enumerate(ana.pages):
+                while j < len(sira_) and sira_[j][0] == idx:
+                    for epg in PdfReader(sira_[j][1]).pages:
+                        w.add_page(epg)
+                    j += 1
+                w.add_page(pg)
+            for _, p in sira_[j:]:
+                for epg in PdfReader(p).pages:
+                    w.add_page(epg)
             tmp = pdf + ".tmp"
             with open(tmp, "wb") as f:
                 w.write(f)
             os.replace(tmp, pdf)
         except Exception as e:
             log_yaz("tarama_log.txt", f"PDF birleştirme: {e!r}")
+
+
+def fatura_mi(r, yol=None):
+    """Fatura / A4 belge mi? Belge türüne, yoksa görüntünün en-boy oranına bakar."""
+    tur = (r["belge_turu"] or "")
+    if "Fatura" in tur or "Pusula" in tur:
+        return True
+    if yol and yol.lower().endswith(".pdf"):
+        return True
+    if yol and yol.lower().endswith(IMG_EXT):
+        try:
+            with Image.open(yol) as im:
+                w, h = im.size
+            return h / float(w) < 1.75 and w >= 900   # fişler uzun ve dar, faturalar A4'e yakın
+        except Exception:
+            return False
+    return False
 
 
 def paket_olustur(db, ym, settings, rows=None, ek_no=0):

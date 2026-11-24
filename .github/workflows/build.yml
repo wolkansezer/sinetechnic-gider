@@ -45,6 +45,6 @@ jobs:
       - name: Sürüm yayınla
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.3.${{ github.run_number }}
-          name: SİNETECHNİC GİDER v1.3.${{ github.run_number }}
+          tag_name: v1.4.${{ github.run_number }}
+          name: SİNETECHNİC GİDER v1.4.${{ github.run_number }}
           files: dist/SINETECHNIC_GIDER.exe
