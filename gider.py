@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
                                QWidget)
 
 APP_NAME = "SİNETECHNİC GİDER"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 OWNER = "Volkan Sezer"
 WEBSITE = "https://www.sinetechnic.com"
 EMAIL = "volkan.sezer@sinetechnic.com"
@@ -131,6 +131,7 @@ def coz(text: str) -> str:
 # ----------------------------------------------------------------- ayarlar
 DEFAULT_SETTINGS = {
     "firma": "SİNETECHNİC",
+    "firma_vkn": "",
     "muhasebeci_ad": "",
     "muhasebeci_eposta": "",
     "bana_kopya": True,
@@ -395,6 +396,17 @@ def _tarama_gorunumu(img):
     return cv2.addWeighted(norm, 1.5, blur, -0.5, 0)
 
 
+def dijital_belge_mi(pil_img):
+    """Ekran görüntüsü / dijital fatura mı? Kenarları neredeyse tamamen beyazsa ve
+    arka planda koyu masa/zemin yoksa taramaya (kırp-düzleştir) gerek yoktur."""
+    import numpy as np
+    g = np.asarray(pil_img.convert("L").resize((400, int(400 * pil_img.height / max(1, pil_img.width)) or 1)))
+    h, w = g.shape
+    b = max(2, int(min(h, w) * 0.04))
+    kenar = np.concatenate([g[:b].ravel(), g[-b:].ravel(), g[:, :b].ravel(), g[:, -b:].ravel()])
+    return (kenar > 225).mean() > 0.85 and (g > 200).mean() > 0.6
+
+
 def belge_tara(pil_img):
     """PIL görüntüsünden taranmış belge (PIL, gri) üretir. (görüntü, fiş_bulundu_mu)"""
     import cv2
@@ -434,6 +446,12 @@ def gorsel_hazirla(src_bytes, tarama=True):
     im.save(orj, "JPEG", quality=85, optimize=True)
     if not tarama:
         return orj.getvalue(), orj.getvalue()
+    try:
+        if dijital_belge_mi(im):
+            # dijital fatura/ekran görüntüsü: kırpma ve renk dönüşümü yapma, olduğu gibi sakla
+            return orj.getvalue(), orj.getvalue()
+    except Exception:
+        pass
     try:
         sc, _ = belge_tara(im)
     except Exception as e:
@@ -537,10 +555,41 @@ def _win_ocr(img):
     return ""
 
 
-def ocr_metin(path):
-    if not path or not path.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")):
+def pdf_sayfa_resmi(path, sayfa=0, olcek=2.0):
+    """PDF sayfasını görüntüye çevirir (önizleme ve taranmış PDF'leri okumak için)."""
+    import pypdfium2 as pdfium  # type: ignore
+    doc = pdfium.PdfDocument(path)
+    try:
+        return doc[sayfa].render(scale=olcek).to_pil().convert("RGB")
+    finally:
+        doc.close()
+
+
+def pdf_metin(path):
+    try:
+        from pypdf import PdfReader  # type: ignore
+        return "\n".join((p.extract_text() or "") for p in PdfReader(path).pages[:3])
+    except Exception as e:
+        log_yaz("ocr_log.txt", f"pdf metin: {e!r}")
         return ""
-    img = Image.open(path).convert("RGB")
+
+
+def ocr_metin(path):
+    if not path:
+        return ""
+    if path.lower().endswith(".pdf"):
+        t = pdf_metin(path)
+        if len(t.strip()) > 40:
+            return t
+        try:
+            img = pdf_sayfa_resmi(path)
+        except Exception as e:
+            log_yaz("ocr_log.txt", f"pdf görüntü: {e!r}")
+            return t
+    elif path.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")):
+        img = Image.open(path).convert("RGB")
+    else:
+        return ""
     for ad, fn in (("rapidocr", _rapid_ocr), ("winocr", _win_ocr)):
         try:
             text = fn(img)
@@ -586,7 +635,7 @@ KATEGORI_KELIME = [
 ]
 
 
-def fis_ayristir(text):
+def fis_ayristir(text, benim_vkn=None):
     """OCR metninden alanları tahmin eder."""
     out = {}
     if not text:
@@ -606,7 +655,18 @@ def fis_ayristir(text):
             out["tarih"] = dt.isoformat()
             break
 
+    # fatura tarihi: "Tarih:" etiketi varsa onu tercih et (irsaliye tarihi değil)
+    m = re.search(r"(?<!IRSALIYE )(?<!IRSALIYE)(?:FATURA\s*)?TARIH[I]?\s*[:.]?\s*(\d{1,2})[./-](\d{1,2})[./-](\d{4})", up)
+    if m:
+        try:
+            dt = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            if date(2020, 1, 1) <= dt <= date.today():
+                out["tarih"] = dt.isoformat()
+        except ValueError:
+            pass
+
     toplam = kdv = None
+    odenecek = False
     for i, ln in enumerate(lines):
         amounts = [a for a in (_tutar(x) for x in TUTAR_RE.findall(ln)) if a is not None]
         if not amounts and i + 1 < len(lines) and re.search(r"TOP", ln):
@@ -614,9 +674,17 @@ def fis_ayristir(text):
         if not amounts:
             continue
         sade = ln.replace(" ", "")
-        if ("TOPKDV" in sade or "TOPLAMKDV" in sade) and kdv is None:
+        if ("TOPKDV" in sade or "TOPLAMKDV" in sade or "HESAPLANANKDV" in sade or "KDVTOPLAM" in sade
+                or "KDVTUTARI" in sade) and kdv is None:
             kdv = amounts[-1]
-        elif ("TOPLAM" in sade or re.search(r"\bTOP\b", ln) or "GENELTOPLAM" in sade or "ODENECEK" in sade) and "KDV" not in sade:
+            mo = re.search(r"%\s?(\d{1,2})", sade)
+            if mo and int(mo.group(1)) in (1, 10, 20):
+                out["kdv_orani"] = float(mo.group(1))
+        elif "ODENECEK" in sade or "VERGILERDAHIL" in sade or "GENELTOPLAM" in sade:
+            toplam = max(toplam or 0, amounts[-1])
+            odenecek = True
+        elif ("TOPLAM" in sade or re.search(r"\bTOP\b", ln)) and "KDV" not in sade and "MATRAH" not in sade \
+                and "HARIC" not in sade and not odenecek:
             toplam = max(toplam or 0, amounts[-1])
     if toplam is None:
         alla = [a for a in (_tutar(x) for x in TUTAR_RE.findall(up)) if a]
@@ -626,20 +694,28 @@ def fis_ayristir(text):
         out["tutar"] = toplam
     if kdv and toplam and kdv < toplam:
         out["kdv"] = kdv
-        oran = kdv / max(0.01, toplam - kdv) * 100
-        out["kdv_orani"] = min((1.0, 10.0, 20.0), key=lambda o: abs(o - oran))
+        if "kdv_orani" not in out:
+            oran = kdv / max(0.01, toplam - kdv) * 100
+            out["kdv_orani"] = min((1.0, 10.0, 20.0), key=lambda o: abs(o - oran))
 
-    m = re.search(r"F[I1]S\s*N[O0]\s*[:.]?\s*(\d+)", up)
+    m = re.search(r"FATURA\s*N[O0]\s*[:.]?\s*([A-Z0-9]{3}\s?\d{9,13})", up)
     if m:
-        out["belge_no"] = m.group(1)
-    m = re.search(r"(?:VKN|V\.?\s?NO|VERGI\s*NO|\bV\.?\s?D\.?\b|\bVD\b)[^\d]{0,25}(\d{10,11})", up)
-    if m:
-        out["vkn"] = m.group(1)
+        out["belge_no"] = m.group(1).replace(" ", "")
+    else:
+        m = re.search(r"F[I1]S\s*N[O0]\s*[:.]?\s*(\d+)", up)
+        if m:
+            out["belge_no"] = m.group(1)
+    # VKN: satıcının (üstteki) numarası; 0000000000 gibi alıcı/boş numaralar atlanır
+    for m in re.finditer(r"(?:VKN|TCKN|V\.?\s?NO|VERGI\s*NO|V\.?\s?D\.?|\bVD\b)[^\d]{0,25}(\d[\d ]{8,13}\d)", up):
+        v = m.group(1).replace(" ", "")
+        if len(v) in (10, 11) and len(set(v)) > 2 and v not in (benim_vkn or ()):
+            out["vkn"] = v
+            break
     m = re.search(r"PLAKA[^A-Z0-9]{0,5}(\d{2}\s?[A-Z]{1,3}\s?\d{2,4})", up)
     if m:
         out["plaka"] = m.group(1).replace(" ", "")
 
-    if re.search(r"E-?\s?ARS[I1]V\s*FATURA", up):
+    if re.search(r"E-?\s?ARS[I1]V\s*FATURA", up) or (re.search(r"E-?\s?ARS[I1]V", up) and "FATURA" in up):
         out["belge_turu"] = "e-Arşiv Fatura"
     elif re.search(r"E-?\s?FATURA", up):
         out["belge_turu"] = "e-Fatura"
@@ -651,10 +727,19 @@ def fis_ayristir(text):
             if kat == "Akaryakıt":
                 out.setdefault("kdv_orani", 20.0)
             break
-    for ln in lines[:6]:
-        if len(re.sub(r"[^A-Z]", "", ln)) >= 4 and not re.search(r"\d{1,2}[./-]\d{1,2}[./-]\d{2}", ln):
-            out["firma"] = ln.title()[:60]
+    unvan = re.compile(r"(A\.?\s?S\.?|LTD|STI|SIRKETI|TIC\.|SAN\.|TICARET|PETROL|AKARYAKIT)\s*$|\b(LTD|STI|A\.S)\b")
+    for ln in lines[:12]:
+        if unvan.search(ln) and len(re.sub(r"[^A-Z]", "", ln)) >= 6:
+            f_ = re.sub(r"\s+", " ", ln)
+            f_ = re.sub(r"\s*A\.?\s?S\.?$", " A.Ş.", f_)
+            f_ = re.sub(r"\s*LTD\.?\s*STI\.?$", " Ltd. Şti.", f_)
+            out["firma"] = f_.title().replace("A.Ş.", "A.Ş.").replace("Ltd. Şti.", "Ltd. Şti.")[:70]
             break
+    else:
+        for ln in lines[:6]:
+            if len(re.sub(r"[^A-Z]", "", ln)) >= 4 and not re.search(r"\d{1,2}[./-]\d{1,2}[./-]\d{2}", ln):
+                out["firma"] = ln.title()[:60]
+                break
     return out
 
 
@@ -955,7 +1040,11 @@ class OcrIs(QRunnable):
         if not text:
             self.bridge.ocr_bitti.emit(self.fid)
             return
-        p = fis_ayristir(text)
+        try:
+            benim = {v for v in (load_settings().get("firma_vkn", "").replace(" ", ""),) if v}
+        except Exception:
+            benim = set()
+        p = fis_ayristir(text, benim)
         upd = {"ocr_metin": text}
         z = self.zorla
         if p.get("belge_turu") and (z or row["belge_turu"] in ("", "ÖKC Fişi")):
@@ -1565,6 +1654,9 @@ class AyarlarDialog(QDialog):
 
         f.addRow(QLabel("<b>Firma</b>"))
         f.addRow("Firma adı:", self.firma)
+        self.fvkn = QLineEdit(s.get("firma_vkn", ""))
+        self.fvkn.setPlaceholderText("Kendi VKN/TCKN'niz (faturalarda satıcı ile karışmasın)")
+        f.addRow("Firma VKN/TCKN:", self.fvkn)
         f.addRow(QLabel("<b>Muhasebeci</b>"))
         f.addRow("Adı:", self.m_ad)
         f.addRow("E-posta:", self.m_ep)
@@ -1632,6 +1724,7 @@ class AyarlarDialog(QDialog):
     def kaydet(self):
         s = self.s
         s["firma"] = self.firma.text().strip()
+        s["firma_vkn"] = self.fvkn.text().strip()
         s["muhasebeci_ad"] = self.m_ad.text().strip()
         s["muhasebeci_eposta"] = self.m_ep.text().strip()
         s["bana_kopya"] = self.kopya.isChecked()
@@ -1703,8 +1796,15 @@ class ImageView(QScrollArea):
             self._fit()
         elif path and path.lower().endswith(".pdf"):
             self.pix = None
-            self.lbl.setPixmap(QPixmap())
-            self.lbl.setText("📄 PDF belge\n(Aç butonuyla görüntüleyin)")
+            try:
+                im = pdf_sayfa_resmi(path, 0, 1.5)
+                b = BytesIO()
+                im.save(b, "PNG")
+                self.pix = QPixmap.fromImage(QImage.fromData(b.getvalue()))
+                self._fit()
+            except Exception:
+                self.lbl.setPixmap(QPixmap())
+                self.lbl.setText("📄 PDF belge\n(Aç butonuyla görüntüleyin)")
         else:
             self.pix = None
             self.lbl.setPixmap(QPixmap())
