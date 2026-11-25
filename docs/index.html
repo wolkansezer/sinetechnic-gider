@@ -33,6 +33,12 @@ button.send:disabled{opacity:.5}
 #msg{margin-top:16px;padding:12px;border-radius:10px;display:none;text-align:center;font-size:16px}
 .ok{background:#1f5132}.err{background:#6b1f1f}.inf{background:#1d2b47}
 #kurulum{display:none}#kurulum input{margin-top:6px}
+#muh{margin:0 0 14px;padding:13px;border-radius:12px;background:#132036;border:1px solid #2e8b57}
+#muh.vurgu{border:2px solid #ff7a1a;background:#1d1a12}
+#muh h3{margin:0 0 8px;font-size:16px}#muh select{margin-bottom:8px}
+#m_durum{font-size:14px;line-height:1.45;color:#cfd8e6;min-height:20px}
+#m_btn{margin-top:10px;width:100%;padding:15px;border-radius:12px;border:none;background:#2e8b57;color:#fff;font-size:17px;font-weight:700}
+#m_btn:disabled{opacity:.5}#m_sonuc{display:none;margin-top:10px;padding:11px;border-radius:10px;font-size:15px;text-align:center}
 a{color:#ffb27a}
 </style>
 </head>
@@ -47,6 +53,13 @@ a{color:#ffb27a}
   <button class="send" id="k_kaydet" style="margin-top:10px">Kaydet</button>
 </div>
 <div id="ban" class="kutu" style="display:none"></div>
+<div id="muh">
+  <h3>📤 Muhasebeciye Gönder</h3>
+  <select id="m_ay"></select>
+  <div id="m_durum">Yükleniyor…</div>
+  <button id="m_btn">📤 Gönder</button>
+  <div id="m_sonuc"></div>
+</div>
 <div id="form">
 <label class="big" for="cam">📷 Fiş Fotoğrafı Çek</label>
 <input id="cam" type="file" accept="image/*" capture="environment" style="display:none">
@@ -89,7 +102,7 @@ function ls(k, v) { try { if (v === undefined) return localStorage.getItem(k); i
 })();
 function cfg() { return { tok: ls('g_tok') || '', repo: ls('g_repo') || VARSAYILAN_REPO }; }
 function kurulumGoster() { var c = cfg(); $('kurulum').style.display = c.tok ? 'none' : 'block'; $('k_repo').value = c.repo; }
-$('k_kaydet').onclick = function () { var t = $('k_tok').value.trim(); if (!t) return; ls('g_tok', t); ls('g_repo', $('k_repo').value.trim() || VARSAYILAN_REPO); kurulumGoster(); show('✅ Telefon bağlandı', 'ok'); };
+$('k_kaydet').onclick = function () { var t = $('k_tok').value.trim(); if (!t) return; ls('g_tok', t); ls('g_repo', $('k_repo').value.trim() || VARSAYILAN_REPO); kurulumGoster(); show('✅ Telefon bağlandı', 'ok'); setTimeout(muhDurum, 300); };
 $('cikis').onclick = function (e) { e.preventDefault(); if (confirm('Bu telefondaki GitHub anahtarı silinsin mi?')) { ls('g_tok', null); kurulumGoster(); } };
 kurulumGoster();
 
@@ -195,6 +208,74 @@ $('q').onclick = kuyrukGonder;
 window.addEventListener('online', kuyrukGonder);
 setInterval(function () { if (kuyruk.length && navigator.onLine) kuyrukGonder(); }, 30000);
 qYukle(); qGuncelle(); if (kuyruk.length) setTimeout(kuyrukGonder, 1500);
+
+// ---- muhasebeciye gönderim (GitHub Actions paketi hazırlayıp e-postalar; PC kapalı olabilir)
+function gh(yol, ayar) {
+  var c = cfg(); ayar = ayar || {};
+  var h = { 'Authorization': 'Bearer ' + c.tok, 'X-GitHub-Api-Version': '2022-11-28',
+            'Accept': ayar.raw ? 'application/vnd.github.raw' : 'application/vnd.github+json' };
+  return fetch('https://api.github.com/repos/' + c.repo + '/contents/' + yol + (ayar.method ? '' : '?t=' + Date.now()),
+    { method: ayar.method || 'GET', headers: h, cache: 'no-store', body: ayar.body ? JSON.stringify(ayar.body) : undefined });
+}
+async function ghJson(yol) { try { var r = await gh(yol, { raw: true }); if (!r.ok) return null; return await r.json(); } catch (e) { return null; } }
+function tlf(v) { return (v || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' TL'; }
+function ayAd(ym) { var p = ym.split('-'); return AY[+p[1] - 1] + ' ' + p[0]; }
+(function () {
+  var b = bugun(), sel = $('m_ay');
+  for (var i = 0; i < 4; i++) {
+    var d = new Date(b.getFullYear(), b.getMonth() - i, 1), ym = d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2);
+    var o = document.createElement('option'); o.value = ym;
+    o.textContent = ayAd(ym) + ' · teslim ' + tr(teslim(d.getFullYear(), d.getMonth()));
+    sel.appendChild(o);
+  }
+  sel.selectedIndex = b.getDate() <= TESLIM ? 1 : 0;
+  if (b.getDate() <= TESLIM) $('muh').className = 'vurgu';
+  sel.onchange = muhDurum;
+})();
+var muhSay = 0;
+async function muhDurum() {
+  if (!cfg().tok) { $('m_durum').textContent = 'Önce telefonu bağla.'; return; }
+  var ym = $('m_ay').value, ben = ++muhSay;
+  $('m_durum').textContent = 'Durum alınıyor…'; $('m_btn').textContent = '📤 ' + ayAd(ym) + ' fişlerini gönder';
+  var k = await ghJson('arsiv/' + ym + '/kayitlar.json') || [];
+  var g = await ghJson('arsiv/' + ym + '/gonderim.json') || { gonderimler: [] };
+  var bekl = 0;
+  try { var r = await gh('gelen'); if (r.ok) (await r.json()).forEach(function (f) { if (f.name.indexOf(ym) === 0) bekl++; }); } catch (e) { }
+  if (ben !== muhSay) return;
+  var gid = {}; g.gonderimler.forEach(function (x) { (x.kayit_idler || []).forEach(function (i) { gid[i] = 1; }); });
+  var top = 0, gonm = 0, gonmTop = 0;
+  k.forEach(function (x) { top += x.tutar || 0; if (!x.gonderildi && !gid[x.id]) { gonm++; gonmTop += x.tutar || 0; } });
+  var son = g.gonderimler.length ? g.gonderimler[g.gonderimler.length - 1] : null;
+  var h = '<b>' + k.length + '</b> fiş işlendi (' + tlf(top) + ')';
+  h += '<br>Gönderilmemiş: <b>' + (gonm + bekl) + '</b>' + (bekl ? ' (' + bekl + ' tanesi henüz PC\'ye inmedi, yine de gönderilir)' : '');
+  if (son) h += '<br>Son gönderim: ' + son.zaman.replace('T', ' ').slice(0, 16) + (son.ek_no ? ' (EK ' + son.ek_no + ')' : '') + ' · ' + son.adet + ' belge';
+  $('m_durum').innerHTML = h;
+  $('m_btn').disabled = (gonm + bekl) === 0;
+  if ((gonm + bekl) === 0) $('m_btn').textContent = '✅ Gönderilecek yeni fiş yok';
+}
+function mSonuc(t, c) { var e = $('m_sonuc'); e.textContent = t; e.className = c; e.style.display = 'block'; }
+$('m_btn').onclick = async function () {
+  var ym = $('m_ay').value;
+  if (!confirm(ayAd(ym) + ' fişleri muhasebeciye e-postayla gönderilsin mi?')) return;
+  var ad = 'gonder-' + ym + '-' + Date.now() + '.json';
+  this.disabled = true; mSonuc('Gönderim başlatılıyor…', 'inf');
+  try {
+    var icerik = btoa(unescape(encodeURIComponent(JSON.stringify({ ay: ym, zaman: new Date().toISOString() }))));
+    var r = await gh('komut/' + ad, { method: 'PUT', body: { message: 'gonder ' + ym, content: icerik } });
+    if (!r.ok) { mSonuc('⚠ Komut gönderilemedi (' + r.status + ')', 'err'); this.disabled = false; return; }
+  } catch (e) { mSonuc('⚠ Bağlantı hatası, tekrar dene', 'err'); this.disabled = false; return; }
+  var bas = Date.now();
+  while (Date.now() - bas < 10 * 60000) {
+    var sn = Math.round((Date.now() - bas) / 1000);
+    mSonuc('⏳ Paket hazırlanıyor ve gönderiliyor… ' + sn + ' sn (genelde 2–4 dk sürer, sayfayı kapatabilirsin)', 'inf');
+    await bekle(10000);
+    var s = await ghJson('komut_sonuc/' + ad);
+    if (s) { mSonuc((s.ok ? '✅ ' : '⚠ ') + s.mesaj, s.ok ? 'ok' : 'err'); muhDurum(); return; }
+  }
+  mSonuc('Sonuç henüz gelmedi. Biraz sonra sayfayı yenileyip "Son gönderim" satırına bak.', 'err');
+  muhDurum();
+};
+if (cfg().tok) muhDurum();
 
 $('s').onclick = async function () {
   if (!cfg().tok) { kurulumGoster(); show('Önce telefonu bağla (üstteki kurulum)', 'err'); return; }

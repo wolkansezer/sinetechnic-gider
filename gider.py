@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
                                QWidget)
 
 APP_NAME = "SİNETECHNİC GİDER"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 OWNER = "Volkan Sezer"
 WEBSITE = "https://www.sinetechnic.com"
 EMAIL = "volkan.sezer@sinetechnic.com"
@@ -206,6 +206,9 @@ class DB:
             self.con.execute("ALTER TABLE fis ADD COLUMN tarih_kesin INTEGER DEFAULT 0")
         if "ek_no" not in cols:
             self.con.execute("ALTER TABLE fis ADD COLUMN ek_no INTEGER")
+        for kol, tip in (("kaynak_adi", "TEXT"), ("bulut_yol", "TEXT"), ("bulut_sha", "TEXT"), ("bulut_mtime", "TEXT")):
+            if kol not in cols:
+                self.con.execute(f"ALTER TABLE fis ADD COLUMN {kol} {tip}")
         self.con.commit()
 
     def add(self, **kw):
@@ -951,6 +954,81 @@ def meta_coz(name):
 
 _bulut_kilit = threading.Lock()
 
+KAYIT_ALANLAR = ["id", "tarih", "firma", "vkn", "belge_turu", "belge_no", "kategori", "tutar", "kdv_orani",
+                 "kdv", "odeme", "plaka", "aciklama", "gonderildi", "ek_no", "kaynak"]
+BULUT_AYAR_ALANLAR = ["firma", "firma_vkn", "muhasebeci_ad", "muhasebeci_eposta", "bana_kopya", "smtp_host",
+                      "smtp_port", "smtp_guvenlik", "smtp_kullanici", "teslim_gunu", "pdf_kolon"]
+
+
+def gh_dosya_al(repo, tok, path, raw=True):
+    """(sha, içerik) — dosya yoksa (None, None)."""
+    st, body = gh_istek("GET", f"{GH_API}/repos/{repo}/contents/{quote(path)}", tok)
+    if st != 200:
+        return None, None
+    j = json.loads(body.decode("utf-8"))
+    if isinstance(j, list):
+        return None, j
+    sha = j.get("sha")
+    if j.get("content") and j.get("encoding") == "base64":
+        return sha, base64.b64decode(j["content"])
+    st, data = gh_istek("GET", f"{GH_API}/repos/{repo}/contents/{quote(path)}", tok, raw=True, timeout=120)
+    return sha, (data if st == 200 else None)
+
+
+def gh_dosya_yaz(repo, tok, path, data, mesaj, sha=None):
+    body = {"message": mesaj, "content": base64.b64encode(data).decode()}
+    if sha:
+        body["sha"] = sha
+    st, raw = gh_istek("PUT", f"{GH_API}/repos/{repo}/contents/{quote(path)}", tok, body, timeout=120)
+    if st == 409 or st == 422:   # sha eskimiş: tazele ve bir kez daha dene
+        sha2, _ = gh_dosya_al(repo, tok, path)
+        if sha2:
+            body["sha"] = sha2
+        st, raw = gh_istek("PUT", f"{GH_API}/repos/{repo}/contents/{quote(path)}", tok, body, timeout=120)
+    if st not in (200, 201):
+        raise RuntimeError(f"GitHub yazma {st}: {raw[:200]!r}")
+    return json.loads(raw.decode("utf-8"))["content"]["sha"]
+
+
+def gh_json_al(repo, tok, path, varsayilan):
+    sha, data = gh_dosya_al(repo, tok, path)
+    if data is None or isinstance(data, list):
+        return None, varsayilan
+    try:
+        return sha, json.loads(data.decode("utf-8"))
+    except Exception:
+        return sha, varsayilan
+
+
+def gonderim_uygula(db, ym, gonderim):
+    """Buluttaki gonderim.json'a göre (telefondan yapılan gönderimler) yerel kayıtları işaretler."""
+    say = 0
+    for g in gonderim.get("gonderimler", []):
+        idler = set(g.get("kayit_idler", []))
+        adlar = set(g.get("gelen_adlar", []))
+        for r in db.month(ym):
+            if r["gonderildi"]:
+                continue
+            if r["id"] in idler or (r["kaynak_adi"] and r["kaynak_adi"] in adlar):
+                db.update(r["id"], gonderildi=g.get("zaman") or datetime.now().isoformat(timespec="seconds"),
+                          ek_no=g.get("ek_no") or 0)
+                say += 1
+    return say
+
+
+def bulut_gonderim_ekle(s, ym, rows, ek_no, paket, kaynak="pc", gelen_adlar=()):
+    tok, repo = gh_anahtar(s), (s.get("github_repo") or "").strip()
+    if not tok or not repo:
+        return
+    path = f"arsiv/{ym}/gonderim.json"
+    sha, g = gh_json_al(repo, tok, path, {"gonderimler": []})
+    g.setdefault("gonderimler", []).append({
+        "zaman": datetime.now().isoformat(timespec="seconds"), "ek_no": ek_no, "kaynak": kaynak,
+        "kayit_idler": [r["id"] for r in rows], "gelen_adlar": list(gelen_adlar),
+        "adet": paket.get("adet"), "toplam": round(paket.get("toplam") or 0, 2)})
+    gh_dosya_yaz(repo, tok, path, json.dumps(g, ensure_ascii=False, indent=1).encode("utf-8"),
+                 f"gonderim {ym} ({kaynak})", sha)
+
 
 class BulutIs(QRunnable):
     def __init__(self, s, db, bridge):
@@ -965,50 +1043,126 @@ class BulutIs(QRunnable):
             if not tok or not repo:
                 self.bridge.bulut_durum.emit("kapalı (Ayarlar → GitHub)")
                 return
-            st, raw = gh_istek("GET", f"{GH_API}/repos/{repo}/contents/gelen", tok)
-            if st == 404:
-                self.bridge.bulut_durum.emit(f"bağlı · bekleyen yok · {datetime.now():%H:%M}")
+            ids = self.gelenleri_al(tok, repo)
+            if ids is None:
                 return
-            if st in (401, 403):
-                self.bridge.bulut_durum.emit("⚠ GitHub anahtarı geçersiz/yetkisiz")
-                return
-            if st != 200:
-                self.bridge.bulut_durum.emit(f"⚠ GitHub hata {st}")
-                return
-            liste = json.loads(raw.decode("utf-8"))
-            ids = []
-            for f in sorted(liste, key=lambda x: x.get("name", "")):
-                if f.get("type") != "file":
-                    continue
-                name, path, sha = f["name"], f["path"], f["sha"]
-                ext = os.path.splitext(name)[1].lower()
-                if ext not in ALL_EXT:
-                    continue
-                st, data = gh_istek("GET", f"{GH_API}/repos/{repo}/contents/{quote(path)}", tok, raw=True, timeout=120)
-                if st != 200 or not data:
-                    continue
-                meta = meta_coz(name)
-                tarih = meta.get("tarih") or date.today().isoformat()
-                if not re.match(r"^\d{4}-\d{2}-\d{2}$", tarih):
-                    tarih = date.today().isoformat()
-                rel = dosya_kaydet(data, ext, tarih, self.s.get("tarama_modu", True))
-                yeni = outer_add(self.db, rel, tarih, kaynak="Telefon (GitHub)",
-                                 kategori=meta.get("kategori") or "Diğer",
-                                 odeme=meta.get("odeme") or "Kredi Kartı",
-                                 plaka=(meta.get("plaka") or "").upper(),
-                                 aciklama=meta.get("not") or "",
-                                 tutar=sayi_oku(str(meta.get("tutar") or "")) or 0,
-                                 tarih_kesin=1 if meta.get("tarih_kesin") else 0)
-                ids.append(yeni)
-                gh_istek("DELETE", f"{GH_API}/repos/{repo}/contents/{quote(path)}", tok,
-                         {"message": f"alindi {name[:10]}", "sha": sha})
+            try:
+                isaretlenen = self.arsiv_senkron(tok, repo)
+            except Exception as e:
+                log_yaz("bulut_log.txt", f"arşiv senkron: {e!r}")
+                isaretlenen = 0
             self.bridge.bulut_durum.emit(f"bağlı · son kontrol {datetime.now():%H:%M}")
             if ids:
                 self.bridge.yeni_fis.emit(ids)
+            elif isaretlenen:
+                self.bridge.yeni_fis.emit([])
         except Exception as e:
             self.bridge.bulut_durum.emit(f"⚠ ulaşılamadı ({type(e).__name__})")
+            log_yaz("bulut_log.txt", f"bulut: {e!r}")
         finally:
             _bulut_kilit.release()
+
+    # ---- telefondan gelen fişleri indir
+    def gelenleri_al(self, tok, repo):
+        st, raw = gh_istek("GET", f"{GH_API}/repos/{repo}/contents/gelen", tok)
+        if st in (401, 403):
+            self.bridge.bulut_durum.emit("⚠ GitHub anahtarı geçersiz/yetkisiz")
+            return None
+        if st == 404:
+            return []
+        if st != 200:
+            self.bridge.bulut_durum.emit(f"⚠ GitHub hata {st}")
+            return None
+        ids = []
+        gonderim_cache = {}
+        for f in sorted(json.loads(raw.decode("utf-8")), key=lambda x: x.get("name", "")):
+            if f.get("type") != "file":
+                continue
+            name, path, sha = f["name"], f["path"], f["sha"]
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in ALL_EXT:
+                continue
+            st, data = gh_istek("GET", f"{GH_API}/repos/{repo}/contents/{quote(path)}", tok, raw=True, timeout=120)
+            if st != 200 or not data:
+                continue
+            meta = meta_coz(name)
+            tarih = meta.get("tarih") or date.today().isoformat()
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", tarih):
+                tarih = date.today().isoformat()
+            rel = dosya_kaydet(data, ext, tarih, self.s.get("tarama_modu", True))
+            yeni = outer_add(self.db, rel, tarih, kaynak="Telefon (GitHub)", kaynak_adi=name,
+                             kategori=meta.get("kategori") or "Diğer",
+                             odeme=meta.get("odeme") or "Kredi Kartı",
+                             plaka=(meta.get("plaka") or "").upper(),
+                             aciklama=meta.get("not") or "",
+                             tutar=sayi_oku(str(meta.get("tutar") or "")) or 0,
+                             tarih_kesin=1 if meta.get("tarih_kesin") else 0)
+            # telefondan muhasebeciye zaten gönderildiyse işaretle
+            ym = tarih[:7]
+            if ym not in gonderim_cache:
+                gonderim_cache[ym] = gh_json_al(repo, tok, f"arsiv/{ym}/gonderim.json", {"gonderimler": []})[1]
+            gonderim_uygula(self.db, ym, gonderim_cache[ym])
+            ids.append(yeni)
+            gh_istek("DELETE", f"{GH_API}/repos/{repo}/contents/{quote(path)}", tok,
+                     {"message": f"alindi {name[:10]}", "sha": sha})
+        return ids
+
+    # ---- işlenmiş fişleri ve bilgilerini buluta yedekle (telefondan gönderim için)
+    def arsiv_senkron(self, tok, repo):
+        import hashlib
+        s = self.s
+        # gönderim ayarları (şifre hariç)
+        ayar = {k: s.get(k) for k in BULUT_AYAR_ALANLAR}
+        ah = hashlib.sha1(json.dumps(ayar, sort_keys=True).encode()).hexdigest()
+        if s.get("bulut_ayar_hash") != ah:
+            sha, _ = gh_dosya_al(repo, tok, "ayar/gonderim.json")
+            gh_dosya_yaz(repo, tok, "ayar/gonderim.json", json.dumps(ayar, ensure_ascii=False, indent=1).encode(),
+                         "ayarlar", sha)
+            s["bulut_ayar_hash"] = ah
+            save_settings(s)
+        bugun = date.today()
+        aylar = set()
+        for i in range(3):   # bu ay ve önceki 2 ay
+            y, m = bugun.year, bugun.month - i
+            while m < 1:
+                y, m = y - 1, m + 12
+            aylar.add(f"{y:04d}-{m:02d}")
+        aylar |= {ym for ym, _ in self.db.unsent_months()}
+        ay_hash = s.setdefault("bulut_ay_hash", {})
+        isaretlenen = 0
+        for ym in sorted(aylar):
+            _, gonderim = gh_json_al(repo, tok, f"arsiv/{ym}/gonderim.json", {"gonderimler": []})
+            isaretlenen += gonderim_uygula(self.db, ym, gonderim)
+            rows = self.db.month(ym)
+            if not rows and ym not in ay_hash:
+                continue
+            for r in rows:
+                p = abs_path(r["dosya"])
+                if not p or not os.path.exists(p):
+                    continue
+                mt = str(int(os.path.getmtime(p)))
+                hedef = f"arsiv/{ym}/{r['id']}_{os.path.basename(p)}"
+                if r["bulut_yol"] == hedef and r["bulut_mtime"] == mt:
+                    continue
+                if r["bulut_yol"] and r["bulut_yol"] != hedef and r["bulut_sha"]:
+                    gh_istek("DELETE", f"{GH_API}/repos/{repo}/contents/{quote(r['bulut_yol'])}", tok,
+                             {"message": "tasindi", "sha": r["bulut_sha"]})
+                    sha_eski = None
+                else:
+                    sha_eski = r["bulut_sha"] if r["bulut_yol"] == hedef else None
+                with open(p, "rb") as f:
+                    yeni_sha = gh_dosya_yaz(repo, tok, hedef, f.read(), f"arsiv {ym}", sha_eski)
+                self.db.update(r["id"], bulut_yol=hedef, bulut_sha=yeni_sha, bulut_mtime=mt)
+            rows = self.db.month(ym)
+            kayitlar = [dict({k: r[k] for k in KAYIT_ALANLAR}, dosya=r["bulut_yol"] or "") for r in rows]
+            h = hashlib.sha1(json.dumps(kayitlar, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            if ay_hash.get(ym) != h:
+                sha, _ = gh_dosya_al(repo, tok, f"arsiv/{ym}/kayitlar.json")
+                gh_dosya_yaz(repo, tok, f"arsiv/{ym}/kayitlar.json",
+                             json.dumps(kayitlar, ensure_ascii=False, indent=1).encode("utf-8"), f"kayitlar {ym}", sha)
+                ay_hash[ym] = h
+                save_settings(s)
+        return isaretlenen
 
 
 # ----------------------------------------------------------------- arka plan OCR
@@ -1516,12 +1670,16 @@ def eposta_gonder(settings, paket, ym, ekler):
     host, port = settings["smtp_host"], int(settings["smtp_port"])
     if settings.get("smtp_guvenlik") == "SSL":
         srv = smtplib.SMTP_SSL(host, port, timeout=60)
+    elif settings.get("smtp_guvenlik") == "YOK":   # yalnızca test sunucuları için
+        srv = smtplib.SMTP(host, port, timeout=60)
+        srv.ehlo()
     else:
         srv = smtplib.SMTP(host, port, timeout=60)
         srv.ehlo()
         srv.starttls()
         srv.ehlo()
-    srv.login(user, pw)
+    if settings.get("smtp_guvenlik") != "YOK" or srv.has_extn("auth"):
+        srv.login(user, pw)
     srv.send_message(msg)
     srv.quit()
 
@@ -2236,6 +2394,11 @@ class Main(QMainWindow):
 
     # ------------------------------------------------ ekleme
     def yeni_fisler(self, ids):
+        if not ids:   # sadece buluttan gönderim durumu güncellendi
+            self.yenile()
+            self.hatirlatma()
+            self.status.setText("📤 Telefondan yapılan muhasebeci gönderimi işlendi")
+            return
         self.ay_listesi(date.today().strftime("%Y-%m"))
         if ids:
             self.cur_id = ids[-1]
@@ -2326,6 +2489,10 @@ class Main(QMainWindow):
                 if QMessageBox.question(self, "Paket hazır",
                                         "Paket klasörü açıldı. Bu fişleri 'gönderildi' olarak işaretleyeyim mi?") == QMessageBox.Yes:
                     self.isaretle(hedef, ek_no)
+                    try:
+                        bulut_gonderim_ekle(self.s, ym, hedef, ek_no, paket, "pc-elle")
+                    except Exception as e2:
+                        log_yaz("bulut_log.txt", f"gönderim kaydı: {e2!r}")
         except Exception as e:
             QApplication.restoreOverrideCursor()
             QMessageBox.warning(self, "Hata", f"İşlem tamamlanamadı:\n{e}")
@@ -2344,6 +2511,10 @@ class Main(QMainWindow):
         paket = paket_olustur(self.db, ym, self.s, rows, ek_no)
         eposta_gonder(self.s, paket, ym, [paket[k] for k in ekler])
         self.isaretle(rows, ek_no)
+        try:
+            bulut_gonderim_ekle(self.s, ym, rows, ek_no, paket, "pc")
+        except Exception as e:
+            log_yaz("bulut_log.txt", f"gönderim kaydı: {e!r}")
         return paket
 
     def smtp_hazir(self):
