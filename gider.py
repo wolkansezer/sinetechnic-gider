@@ -905,6 +905,7 @@ def outer_add(db, rel, tarih, **kw):
     oran = 20.0
     kdv = round(tutar - tutar / (1 + oran / 100), 2) if tutar else 0
     belge = "e-Arşiv Fatura" if rel.lower().endswith(".pdf") else "ÖKC Fişi"
+    belge = kw.pop("belge_turu", None) or belge
     return db.add(tarih=tarih, dosya=rel, kdv_orani=oran, kdv=kdv, belge_turu=belge, **kw)
 
 
